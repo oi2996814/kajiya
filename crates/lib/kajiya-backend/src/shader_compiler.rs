@@ -1,5 +1,5 @@
 use crate::file::LoadFile;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use relative_path::RelativePathBuf;
 use std::{path::PathBuf, sync::Arc};
@@ -46,7 +46,9 @@ impl LazyWorker for CompileShader {
                     &mut ShaderIncludeProvider { ctx },
                     String::new(),
                 );
-                let source = source.map_err(|err| anyhow!("{}", err))?;
+                let source = source
+                    .map_err(|err| anyhow!("{}", err))
+                    .with_context(|| format!("shader path: {:?}", self.path))?;
                 let target_profile = format!("{}_6_4", self.profile);
                 let spirv = compile_generic_shader_hlsl_impl(&name, &source, &target_profile)?;
 
@@ -109,14 +111,17 @@ struct ShaderIncludeProvider {
     ctx: RunContext,
 }
 
-impl<'a> shader_prepper::IncludeProvider for ShaderIncludeProvider {
+impl shader_prepper::IncludeProvider for ShaderIncludeProvider {
     type IncludeContext = String;
 
     fn get_include(
         &mut self,
         path: &str,
         parent_file: &Self::IncludeContext,
-    ) -> std::result::Result<(String, Self::IncludeContext), failure::Error> {
+    ) -> std::result::Result<
+        (String, Self::IncludeContext),
+        shader_prepper::BoxedIncludeProviderError,
+    > {
         let resolved_path = if let Some('/') = path.chars().next() {
             path.to_owned()
         } else {
@@ -125,21 +130,14 @@ impl<'a> shader_prepper::IncludeProvider for ShaderIncludeProvider {
             folder.join(path).as_str().to_string()
         };
 
-        // println!("shader include '{}' resolved to '{}'", path, resolved_path);
-
         let blob: Arc<Bytes> = smol::block_on(
             crate::file::LoadFile::new(&resolved_path)
-                .map_err(|err| {
-                    failure::err_msg(format!("Failed loading shader include {}: {:?}", path, err))
-                })?
+                .with_context(|| format!("Failed loading shader include {}", path))?
                 .into_lazy()
                 .eval(&self.ctx),
-        )
-        .map_err(|err| failure::format_err!("{}", err))?;
+        )?;
 
-        String::from_utf8(blob.to_vec())
-            .map_err(|e| failure::format_err!("{}", e))
-            .map(|ok| (ok, resolved_path))
+        Ok((String::from_utf8(blob.to_vec())?, resolved_path))
     }
 }
 
@@ -183,11 +181,11 @@ fn compile_generic_shader_hlsl_impl(
         target_profile,
         &[
             "-spirv",
-            "-enable-templates",
             //"-enable-16bit-types",
             "-fspv-target-env=vulkan1.2",
-            "-WX",  // warnings as errors
-            "-Ges", // strict mode
+            "-WX",      // warnings as errors
+            "-Ges",     // strict mode
+            "-HV 2021", // HLSL version 2021
         ],
         &[],
     )

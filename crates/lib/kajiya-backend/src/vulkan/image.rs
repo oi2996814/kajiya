@@ -1,5 +1,8 @@
+#![allow(clippy::let_and_return)]
+
+use crate::BackendError;
+
 use super::device::Device;
-use anyhow::{Context, Result};
 use ash::vk;
 use derive_builder::Builder;
 use gpu_allocator::{AllocationCreateDesc, MemoryLocation};
@@ -168,17 +171,18 @@ unsafe impl Send for Image {}
 unsafe impl Sync for Image {}
 
 impl Image {
-    pub fn view(&self, device: &Device, desc: &ImageViewDesc) -> vk::ImageView {
+    pub fn view(
+        &self,
+        device: &Device,
+        desc: &ImageViewDesc,
+    ) -> Result<vk::ImageView, BackendError> {
         let mut views = self.views.lock();
 
         if let Some(entry) = views.get(desc) {
-            *entry
+            Ok(*entry)
         } else {
-            *views.entry(*desc).or_insert_with(|| {
-                device
-                    .create_image_view(*desc, &self.desc, self.raw)
-                    .unwrap()
-            })
+            let view = device.create_image_view(*desc, &self.desc, self.raw)?;
+            Ok(*views.entry(*desc).or_insert(view))
         }
     }
 
@@ -247,7 +251,7 @@ impl Device {
         &self,
         desc: ImageDesc,
         initial_data: Vec<ImageSubResourceData>,
-    ) -> Result<Image> {
+    ) -> Result<Image, BackendError> {
         log::info!("Creating an image: {:?}", desc);
 
         let create_info = get_image_create_info(&desc, !initial_data.is_empty());
@@ -277,7 +281,10 @@ impl Device {
                 location: MemoryLocation::GpuOnly,
                 linear: false,
             })
-            .context("GpuOnly image allocation")?;
+            .map_err(|err| BackendError::Allocation {
+                inner: err,
+                name: "GpuOnly image".into(),
+            })?;
 
         // Bind memory to the image
         unsafe {
@@ -289,17 +296,30 @@ impl Device {
         if !initial_data.is_empty() {
             let total_initial_data_bytes = initial_data.iter().map(|d| d.data.len()).sum();
 
-            let mut image_buffer = self
-                .create_buffer_impl(
-                    super::buffer::BufferDesc {
-                        size: total_initial_data_bytes,
-                        usage: vk::BufferUsageFlags::TRANSFER_SRC,
-                        mapped: true,
-                    },
-                    Default::default(),
-                    MemoryLocation::CpuToGpu,
-                )
-                .context("CpuToGpu image staging buffer")?;
+            let block_bytes: usize = match desc.format {
+                vk::Format::R8G8B8A8_UNORM => 1,
+                vk::Format::R8G8B8A8_SRGB => 1,
+                vk::Format::R32G32B32A32_SFLOAT => 1,
+                vk::Format::R16G16B16A16_SFLOAT => 1,
+                vk::Format::BC1_RGB_UNORM_BLOCK => 8,
+                vk::Format::BC1_RGB_SRGB_BLOCK => 8,
+                vk::Format::BC3_UNORM_BLOCK => 16,
+                vk::Format::BC3_SRGB_BLOCK => 16,
+                vk::Format::BC5_UNORM_BLOCK => 16,
+                vk::Format::BC5_SNORM_BLOCK => 16,
+                vk::Format::BC7_UNORM_BLOCK => 16,
+                vk::Format::BC7_SRGB_BLOCK => 16,
+                _ => todo!("{:?}", desc.format),
+            };
+
+            let mut image_buffer = self.create_buffer(
+                super::buffer::BufferDesc::new_cpu_to_gpu(
+                    total_initial_data_bytes,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                ),
+                "Image initial data buffer",
+                None,
+            )?;
 
             let mapped_slice_mut = image_buffer.allocation.mapped_slice_mut().unwrap();
             let mut offset = 0;
@@ -309,6 +329,7 @@ impl Device {
                 .enumerate()
                 .map(|(level, sub)| {
                     mapped_slice_mut[offset..offset + sub.data.len()].copy_from_slice(sub.data);
+                    assert_eq!(offset % block_bytes, 0);
 
                     let region = vk::BufferImageCopy::builder()
                         .buffer_offset(offset as _)
@@ -326,13 +347,18 @@ impl Device {
                         });
 
                     offset += sub.data.len();
-                    region.build()
+                    let region = region.build();
+
+                    //dbg!(region);
+                    //dbg!(total_initial_data_bytes);
+
+                    region
                 })
                 .collect::<Vec<_>>();
 
             // println!("regions: {:#?}", buffer_copy_regions);
 
-            self.with_setup_cb(|cb| unsafe {
+            let copy_result = self.with_setup_cb(|cb| unsafe {
                 super::barrier::record_image_barrier(
                     self,
                     cb,
@@ -364,6 +390,10 @@ impl Device {
                     ),
                 )
             });
+
+            self.immediate_destroy_buffer(image_buffer);
+
+            copy_result?;
         }
 
         /*        let handle = self.storage.insert(Image {
@@ -385,7 +415,16 @@ impl Device {
         desc: ImageViewDesc,
         image_desc: &ImageDesc,
         image_raw: vk::Image,
-    ) -> Result<vk::ImageView> {
+    ) -> Result<vk::ImageView, BackendError> {
+        if image_desc.format == vk::Format::D32_SFLOAT
+            && !desc.aspect_mask.contains(vk::ImageAspectFlags::DEPTH)
+        {
+            return Err(BackendError::ResourceAccess {
+                info: "Depth-only resource used without the vk::ImageAspectFlags::DEPTH flag"
+                    .to_owned(),
+            });
+        }
+
         let create_info = vk::ImageViewCreateInfo {
             image: image_raw,
             ..Image::view_desc_impl(desc, image_desc)
@@ -458,7 +497,7 @@ pub fn get_image_create_info(desc: &ImageDesc, initial_data: bool) -> vk::ImageC
             vk::Extent3D {
                 width: desc.extent[0],
                 height: desc.extent[1],
-                depth: desc.extent[2] as u32,
+                depth: desc.extent[2],
             },
             1,
         ),
@@ -494,7 +533,7 @@ pub fn get_image_create_info(desc: &ImageDesc, initial_data: bool) -> vk::ImageC
         format: desc.format,
         extent: image_extent,
         mip_levels: desc.mip_levels as u32,
-        array_layers: image_layers as u32,
+        array_layers: image_layers,
         samples: vk::SampleCountFlags::TYPE_1, // TODO: desc.sample_count
         tiling: desc.tiling,
         usage: image_usage,

@@ -7,15 +7,19 @@ edition = "2021"
 
 [dependencies]
 kajiya = { path = "../../lib/kajiya" }
-kajiya-simple = { path = "../../lib/kajiya-simple", features = ["dear-imgui"] }
+kajiya-simple = { path = "../../lib/kajiya-simple", features = ["dear-imgui", "winit_serde"] }
+kajiya-asset-pipe = { path = "../../lib/kajiya-asset-pipe"}
 
 anyhow = "1.0"
-dolly = "0.1"
+dolly = "=0.4.0"
 imgui = "0.7"
 log = "0.4"
 ron = "0.6.2"
 serde = { version = "1.0", features = ["derive"] }
 structopt = "0.3"
+toml = "0.7.2"
+splines = { version = "4.2.0", features = ["glam"] }
 
 [features]
 dlss = ["kajiya/dlss"]
+puffin-server = ['kajiya-simple/puffin-server']

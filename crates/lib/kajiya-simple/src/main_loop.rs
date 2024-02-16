@@ -23,8 +23,9 @@ use winit::{
 pub struct FrameContext<'a> {
     pub dt_filtered: f32,
     pub render_extent: [u32; 2],
-    pub events: &'a [WindowEvent<'static>],
+    pub events: &'a [Event<'static, ()>],
     pub world_renderer: &'a mut WorldRenderer,
+    pub window: &'a winit::window::Window,
 
     #[cfg(feature = "dear-imgui")]
     pub imgui: Option<ImguiContext<'a>>,
@@ -87,6 +88,7 @@ pub struct SimpleMainLoopBuilder {
     vsync: bool,
     fullscreen: Option<FullscreenMode>,
     graphics_debugging: bool,
+    physical_device_index: Option<usize>,
     default_log_level: log::LevelFilter,
     window_scale: WindowScale,
     temporal_upsampling: f32,
@@ -105,6 +107,7 @@ impl SimpleMainLoopBuilder {
             vsync: true,
             fullscreen: None,
             graphics_debugging: false,
+            physical_device_index: None,
             default_log_level: log::LevelFilter::Warn,
             window_scale: WindowScale::SystemNative,
             temporal_upsampling: 1.0,
@@ -123,6 +126,11 @@ impl SimpleMainLoopBuilder {
 
     pub fn graphics_debugging(mut self, graphics_debugging: bool) -> Self {
         self.graphics_debugging = graphics_debugging;
+        self
+    }
+
+    pub fn physical_device_index(mut self, physical_device_index: Option<usize>) -> Self {
+        self.physical_device_index = physical_device_index;
         self
     }
 
@@ -238,6 +246,7 @@ impl SimpleMainLoop {
                 swapchain_extent,
                 vsync: builder.vsync,
                 graphics_debugging: builder.graphics_debugging,
+                device_index: builder.physical_device_index,
             },
         )?;
 
@@ -329,7 +338,9 @@ impl SimpleMainLoop {
 
         let mut running = true;
         while running {
+            gpu_profiler::profiler().begin_frame();
             let gpu_frame_start_ns = puffin::now_ns();
+
             puffin::profile_scope!("main loop");
             puffin::GlobalProfiler::lock().new_frame();
 
@@ -350,20 +361,28 @@ impl SimpleMainLoop {
 
                 *control_flow = ControlFlow::Poll;
 
-                match event {
+                let mut allow_event = true;
+                match &event {
                     Event::WindowEvent { event, .. } => match event {
                         WindowEvent::CloseRequested => {
                             *control_flow = ControlFlow::Exit;
                             running = false;
                         }
                         WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. }
-                            if ui_wants_mouse => {}
-                        _ => events.extend(event.to_static()),
+                            if ui_wants_mouse =>
+                        {
+                            allow_event = false;
+                        }
+                        _ => {}
                     },
                     Event::MainEventsCleared => {
                         *control_flow = ControlFlow::Exit;
                     }
                     _ => (),
+                }
+
+                if allow_event {
+                    events.extend(event.to_static());
                 }
             });
 
@@ -405,6 +424,7 @@ impl SimpleMainLoop {
                 render_extent,
                 events: &events,
                 world_renderer: &mut world_renderer,
+                window: &window,
 
                 #[cfg(feature = "dear-imgui")]
                 imgui: Some(ImguiContext {
@@ -474,42 +494,12 @@ impl SimpleMainLoop {
                 }
             }
 
-            report_gpu_stats_to_puffin(&gpu_profiler::get_stats(), gpu_frame_start_ns);
+            gpu_profiler::profiler().end_frame();
+            if let Some(report) = gpu_profiler::profiler().last_report() {
+                report.send_to_puffin(gpu_frame_start_ns);
+            };
         }
 
         Ok(())
     }
-}
-
-fn report_gpu_stats_to_puffin(
-    gpu_stats: &gpu_profiler::GpuProfilerStats,
-    gpu_frame_start_ns: puffin::NanoSecond,
-) {
-    let mut stream = puffin::Stream::default();
-    let gpu_scopes = gpu_stats.get_ordered();
-    let mut gpu_time_accum: puffin::NanoSecond = 0;
-    let mut puffin_scope_count = 0;
-    let main_gpu_scope_offset = stream.begin_scope(gpu_frame_start_ns, "frame", "", "");
-    puffin_scope_count += 1;
-    puffin_scope_count += gpu_scopes.len();
-    for (scope, ms) in gpu_scopes {
-        let ns = (ms * 1_000_000.0) as puffin::NanoSecond;
-        let offset = stream.begin_scope(gpu_frame_start_ns + gpu_time_accum, &scope.name, "", "");
-        gpu_time_accum += ns;
-        stream.end_scope(offset, gpu_frame_start_ns + gpu_time_accum);
-    }
-    stream.end_scope(main_gpu_scope_offset, gpu_frame_start_ns + gpu_time_accum);
-    puffin::global_reporter(
-        puffin::ThreadInfo {
-            start_time_ns: None,
-            name: "gpu".to_owned(),
-        },
-        &puffin::StreamInfo {
-            num_scopes: puffin_scope_count,
-            stream,
-            depth: 1,
-            range_ns: (gpu_frame_start_ns, gpu_frame_start_ns + gpu_time_accum),
-        }
-        .as_stream_into_ref(),
-    );
 }

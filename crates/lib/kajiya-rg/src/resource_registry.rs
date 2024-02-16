@@ -12,6 +12,7 @@ use kajiya_backend::{
         ray_tracing::{RayTracingAcceleration, RayTracingPipeline},
         shader::{ComputePipeline, RasterPipeline},
     },
+    BackendError,
 };
 use std::sync::Arc;
 
@@ -35,11 +36,13 @@ impl AnyRenderResource {
     pub fn borrow(&self) -> AnyRenderResourceRef {
         match self {
             AnyRenderResource::OwnedImage(inner) => AnyRenderResourceRef::Image(inner),
-            AnyRenderResource::ImportedImage(inner) => AnyRenderResourceRef::Image(&*inner),
+            AnyRenderResource::ImportedImage(inner) => AnyRenderResourceRef::Image(inner.as_ref()),
             AnyRenderResource::OwnedBuffer(inner) => AnyRenderResourceRef::Buffer(inner),
-            AnyRenderResource::ImportedBuffer(inner) => AnyRenderResourceRef::Buffer(&*inner),
+            AnyRenderResource::ImportedBuffer(inner) => {
+                AnyRenderResourceRef::Buffer(inner.as_ref())
+            }
             AnyRenderResource::ImportedRayTracingAcceleration(inner) => {
-                AnyRenderResourceRef::RayTracingAcceleration(&*inner)
+                AnyRenderResourceRef::RayTracingAcceleration(inner.as_ref())
             }
             AnyRenderResource::Pending { .. } => {
                 panic!("AnyRenderResource::borrow called while the resource was in Pending state")
@@ -76,7 +79,7 @@ impl<'exec_params, 'constants> ResourceRegistry<'exec_params, 'constants> {
         handle: GraphRawResourceHandle,
     ) -> &Image {
         match &self.resources[handle.id as usize].resource.borrow() {
-            AnyRenderResourceRef::Image(img) => *img,
+            AnyRenderResourceRef::Image(img) => img,
             _ => panic!(),
         }
     }
@@ -90,7 +93,7 @@ impl<'exec_params, 'constants> ResourceRegistry<'exec_params, 'constants> {
         handle: GraphRawResourceHandle,
     ) -> &Buffer {
         match &self.resources[handle.id as usize].resource.borrow() {
-            AnyRenderResourceRef::Buffer(buffer) => *buffer,
+            AnyRenderResourceRef::Buffer(buffer) => buffer,
             _ => panic!(),
         }
     }
@@ -107,7 +110,7 @@ impl<'exec_params, 'constants> ResourceRegistry<'exec_params, 'constants> {
         handle: GraphRawResourceHandle,
     ) -> &RayTracingAcceleration {
         match &self.resources[handle.id as usize].resource.borrow() {
-            AnyRenderResourceRef::RayTracingAcceleration(acc) => *acc,
+            AnyRenderResourceRef::RayTracingAcceleration(acc) => acc,
             _ => panic!(),
         }
     }
@@ -116,7 +119,7 @@ impl<'exec_params, 'constants> ResourceRegistry<'exec_params, 'constants> {
         &'s self,
         resource: GraphRawResourceHandle,
         view_desc: &ImageViewDesc,
-    ) -> vk::ImageView
+    ) -> Result<vk::ImageView, BackendError>
     where
         's: 'a,
     {

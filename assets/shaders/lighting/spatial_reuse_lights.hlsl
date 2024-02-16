@@ -30,10 +30,6 @@
 
 #define RENDER_INTO_RTR 1
 
-float inverse_lerp(float minv, float maxv, float v) {
-    return (v - minv) / (maxv - minv);
-}
-
 [numthreads(8, 8, 1)]
 void main(uint2 px : SV_DispatchThreadID) {
     uint2 orig_px = px;
@@ -74,15 +70,15 @@ void main(uint2 px : SV_DispatchThreadID) {
         LayeredBrdf layered_brdf = LayeredBrdf::from_gbuffer_ndotv(gbuffer, wo.z);
         specular_brdf = layered_brdf.specular_brdf;
 
-        // TODO: integrate into te specular BRDF so it doesn't need explicit handling everywhere
+        // TODO: integrate into the specular BRDF so it doesn't need explicit handling everywhere
         energy_preservation_mult = layered_brdf.energy_preservation.preintegrated_reflection_mult;
     }
 
     // Index used to calculate a sample set disjoint for all four pixels in the quad
     // Offsetting by frame index reduces small structured artifacts
-    const uint px_idx_in_quad = (((px.x & 1) | (px.y & 1) * 2) + (SHUFFLE_SUBPIXELS ? 1 : 0) * frame_constants.frame_index) & 3;
+    const uint px_idx_in_quad = (((px.x & 1) | (px.y & 1) * 2) + select(SHUFFLE_SUBPIXELS, 1, 0) * frame_constants.frame_index) & 3;
 
-    const uint sample_count = BORROW_SAMPLES ? 8 : 1;
+    const uint sample_count = select(BORROW_SAMPLES, 8, 1);
     const uint filter_idx = 3;
 
     float4 contrib_accum = 0.0;
@@ -98,15 +94,8 @@ void main(uint2 px : SV_DispatchThreadID) {
         const float4 packed0 = hit0_tex[sample_px];
 
         if (packed0.w != 0 && sample_depth != 0) {
-            // Note: must match the raygen
-            uint2 hi_px_subpixels[4] = {
-                uint2(0, 0),
-                uint2(1, 1),
-                uint2(1, 0),
-                uint2(0, 1),
-            };
             const float2 sample_uv = get_uv(
-                sample_px * 2 + hi_px_subpixels[frame_constants.frame_index & 3],
+                sample_px * 2 + HALFRES_SUBSAMPLE_OFFSET,
                 output_tex_size);
 
             const ViewRayContext sample_ray_ctx = ViewRayContext::from_uv_and_depth(sample_uv, sample_depth);
@@ -140,7 +129,7 @@ void main(uint2 px : SV_DispatchThreadID) {
                     // be rejected by the bias, thus skewing sample counting.
                     //if (wi.z > 0 && dot(center_to_hit_vs, normal_vs) * 0.2 / length(center_to_hit_vs) < dot(surface_offset, normal_vs) / length(surface_offset)) {
                     if (wi.z > 0 && wi.z * 0.2 < fraction_of_normal_direction_as_offset) {
-            			rejection_bias *= sample_i == 0 ? 1 : 0;
+            			rejection_bias *= select(sample_i == 0, 1, 0);
             		}
                 #endif
             }
@@ -157,12 +146,12 @@ void main(uint2 px : SV_DispatchThreadID) {
 
             // Note: should indeed be step(0, wi.z) since the cosine factor is part
             // of the measure conversion from area to projected solid angle.
-            const float3 contrib_rgb = packed0.rgb * spec.value * energy_preservation_mult * step(0.0, wi.z) * (neighbor_sampling_pdf > 0 ? (1 / neighbor_sampling_pdf) : 0);
+            const float3 contrib_rgb = packed0.rgb * spec.value * energy_preservation_mult * step(0.0, wi.z) * select(neighbor_sampling_pdf > 0, (1 / neighbor_sampling_pdf), 0);
             const float contrib_wt = rejection_bias;
 
             contrib_accum += float4(contrib_rgb, 1) * contrib_wt;
 
-            float luma = calculate_luma(packed0.rgb);
+            float luminance = sRGB_to_luminance(packed0.rgb);
         }
     }
 

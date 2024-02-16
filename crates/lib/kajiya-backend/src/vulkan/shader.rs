@@ -19,7 +19,6 @@ use std::{
 };
 
 pub const MAX_DESCRIPTOR_SETS: usize = 4;
-pub const MAX_BINDLESS_DESCRIPTOR_COUNT: usize = 512 * 1024;
 
 type DescriptorSetLayout = HashMap<u32, rspirv_reflect::DescriptorInfo>;
 type StageDescriptorSetLayouts = HashMap<u32, DescriptorSetLayout>;
@@ -136,10 +135,6 @@ pub fn create_descriptor_set_layouts(
             let mut set_layout_create_flags = vk::DescriptorSetLayoutCreateFlags::empty();
 
             for (binding_index, binding) in set.iter() {
-                /*if binding.name == "bindless_textures" {
-                    panic!("{:?}", binding);
-                }*/
-
                 match binding.ty {
                     rspirv_reflect::DescriptorType::UNIFORM_BUFFER
                     | rspirv_reflect::DescriptorType::UNIFORM_TEXEL_BUFFER
@@ -196,7 +191,7 @@ pub fn create_descriptor_set_layouts(
                             rspirv_reflect::DescriptorDimensionality::Single => 1,
                             rspirv_reflect::DescriptorDimensionality::Array(size) => size,
                             rspirv_reflect::DescriptorDimensionality::RuntimeArray => {
-                                MAX_BINDLESS_DESCRIPTOR_COUNT as u32
+                                device.max_bindless_descriptor_count()
                             }
                         };
 
@@ -453,8 +448,7 @@ pub fn create_compute_pipeline(
         let mut descriptor_pool_sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
         for bindings in set_layout_info.iter() {
             for ty in bindings.values() {
-                if let Some(mut dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty)
-                {
+                if let Some(dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty) {
                     dps.descriptor_count += 1;
                 } else {
                     descriptor_pool_sizes.push(vk::DescriptorPoolSize {
@@ -529,6 +523,8 @@ pub struct RasterPipelineDesc {
     pub render_pass: Arc<RenderPass>,
     #[builder(default)]
     pub face_cull: bool,
+    #[builder(default = "true")]
+    pub depth_write: bool,
     #[builder(default)]
     pub push_constants_bytes: usize,
 }
@@ -720,10 +716,7 @@ pub struct RenderPass {
     pub framebuffer_cache: FramebufferCache,
 }
 
-pub fn create_render_pass(
-    device: &Device,
-    desc: RenderPassDesc<'_>,
-) -> anyhow::Result<Arc<RenderPass>> {
+pub fn create_render_pass(device: &Device, desc: RenderPassDesc<'_>) -> Arc<RenderPass> {
     let renderpass_attachments = desc
         .color_attachments
         .iter()
@@ -788,14 +781,14 @@ pub fn create_render_pass(
             .unwrap()
     };
 
-    Ok(Arc::new(RenderPass {
+    Arc::new(RenderPass {
         raw: render_pass,
         framebuffer_cache: FramebufferCache::new(
             render_pass,
             desc.color_attachments,
             desc.depth_attachment,
         ),
-    }))
+    })
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -935,7 +928,7 @@ pub fn create_raster_pipeline(
         };
         let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
             depth_test_enable: 1,
-            depth_write_enable: 1,
+            depth_write_enable: if desc.depth_write { 1 } else { 0 },
             depth_compare_op: vk::CompareOp::GREATER_OR_EQUAL,
             front: noop_stencil_state,
             back: noop_stencil_state,
@@ -990,8 +983,7 @@ pub fn create_raster_pipeline(
         let mut descriptor_pool_sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
         for bindings in set_layout_info.iter() {
             for ty in bindings.values() {
-                if let Some(mut dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty)
-                {
+                if let Some(dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty) {
                     dps.descriptor_count += 1;
                 } else {
                     descriptor_pool_sizes.push(vk::DescriptorPoolSize {

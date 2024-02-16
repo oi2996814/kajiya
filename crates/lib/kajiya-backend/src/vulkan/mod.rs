@@ -1,10 +1,11 @@
 pub mod barrier;
 pub mod buffer;
 pub mod device;
+pub mod error;
 pub mod image;
 pub mod instance;
 pub mod physical_device;
-pub mod profiler;
+mod profiler;
 pub mod ray_tracing;
 pub mod shader;
 pub mod surface;
@@ -40,6 +41,7 @@ pub struct RenderBackendConfig {
     pub swapchain_extent: [u32; 2],
     pub vsync: bool,
     pub graphics_debugging: bool,
+    pub device_index: Option<usize>,
 }
 
 impl RenderBackend {
@@ -69,7 +71,9 @@ impl RenderBackend {
                 .collect::<Vec<_>>()
         );
 
-        let physical_device = Arc::new(
+        let physical_device = Arc::new(if let Some(device_index) = config.device_index {
+            physical_devices.into_iter().nth(device_index).unwrap()
+        } else {
             physical_devices
                 .into_iter()
                 // If there are multiple devices with the same score, `max_by_key` would choose the last,
@@ -81,8 +85,8 @@ impl RenderBackend {
                     vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
                     _ => 0,
                 })
-                .unwrap(),
-        );
+                .unwrap()
+        });
 
         info!("Selected physical device: {:#?}", *physical_device);
 

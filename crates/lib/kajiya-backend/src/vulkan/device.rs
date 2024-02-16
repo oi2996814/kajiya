@@ -1,6 +1,11 @@
+use crate::{vulkan::buffer::BufferDesc, BackendError};
+
+pub use super::profiler::VkProfilerData;
 use super::{
+    buffer::Buffer,
+    error::CrashMarkerNames,
     physical_device::{PhysicalDevice, QueueFamily},
-    profiler::VkProfilerData,
+    profiler::ProfilerBackend,
 };
 use anyhow::Result;
 use ash::{
@@ -8,6 +13,7 @@ use ash::{
     vk,
 };
 use gpu_allocator::{AllocatorDebugSettings, VulkanAllocator, VulkanAllocatorCreateDesc};
+use gpu_profiler::backend::ash::VulkanProfilerFrame;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
@@ -16,6 +22,11 @@ use std::{
     os::raw::c_char,
     sync::Arc,
 };
+
+/// Descriptor count to subtract from the max bindless descriptor count,
+/// so that we don't overflow the max when using bindless _and_ non-bindless descriptors
+/// in the same shader stage.
+pub const RESERVED_DESCRIPTOR_COUNT: u32 = 32;
 
 pub struct Queue {
     pub raw: vk::Queue,
@@ -101,6 +112,7 @@ impl CommandBuffer {
 
 impl DeviceFrame {
     pub fn new(
+        pdevice: &PhysicalDevice,
         device: &ash::Device,
         global_allocator: &mut VulkanAllocator,
         queue_family: &QueueFamily,
@@ -118,7 +130,14 @@ impl DeviceFrame {
             main_command_buffer: CommandBuffer::new(device, queue_family).unwrap(),
             presentation_command_buffer: CommandBuffer::new(device, queue_family).unwrap(),
             pending_resource_releases: Default::default(),
-            profiler_data: VkProfilerData::new(device, global_allocator),
+            profiler_data: VulkanProfilerFrame::new(
+                device,
+                ProfilerBackend::new(
+                    device,
+                    global_allocator,
+                    pdevice.properties.limits.timestamp_period,
+                ),
+            ),
         }
     }
 }
@@ -132,19 +151,48 @@ pub struct Device {
     pub(crate) immutable_samplers: HashMap<SamplerDesc, vk::Sampler>,
     pub(crate) setup_cb: Mutex<CommandBuffer>,
 
+    pub(crate) crash_tracking_buffer: Buffer,
+    pub(crate) crash_marker_names: Mutex<CrashMarkerNames>,
+
     pub acceleration_structure_ext: khr::AccelerationStructure,
     pub ray_tracing_pipeline_ext: khr::RayTracingPipeline,
     // pub ray_query_ext: khr::RayQuery,
     pub ray_tracing_pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
 
     frames: [Mutex<Arc<DeviceFrame>>; 2],
+
+    ray_tracing_enabled: bool,
 }
+
+// Allowing `Send` on `frames` is technically unsound. There are some checks
+// in place that `Arc<DeviceFrame>` doesn't get retained by the user,
+// but it begs for a clearer solution.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Device {}
+
 unsafe impl Sync for Device {}
 
 impl Device {
-    fn extension_names(pdevice: &Arc<PhysicalDevice>) -> Vec<*const i8> {
-        let mut device_extension_names_raw = vec![
+    pub fn create(pdevice: &Arc<PhysicalDevice>) -> Result<Arc<Self>> {
+        let supported_extensions: HashSet<String> = unsafe {
+            let extension_properties = pdevice
+                .instance
+                .raw
+                .enumerate_device_extension_properties(pdevice.raw)?;
+            debug!("Extension properties:\n{:#?}", &extension_properties);
+
+            extension_properties
+                .iter()
+                .map(|ext| {
+                    std::ffi::CStr::from_ptr(ext.extension_name.as_ptr() as *const c_char)
+                        .to_string_lossy()
+                        .as_ref()
+                        .to_owned()
+                })
+                .collect()
+        };
+
+        let mut device_extension_names = vec![
             vk::ExtDescriptorIndexingFn::name().as_ptr(),
             vk::ExtScalarBlockLayoutFn::name().as_ptr(),
             vk::KhrMaintenance1Fn::name().as_ptr(),
@@ -155,10 +203,8 @@ impl Device {
             vk::KhrImagelessFramebufferFn::name().as_ptr(),
             vk::KhrImageFormatListFn::name().as_ptr(),
             vk::KhrDescriptorUpdateTemplateFn::name().as_ptr(),
-            vk::KhrDrawIndirectCountFn::name().as_ptr(),
             // Rust-GPU
             vk::KhrShaderFloat16Int8Fn::name().as_ptr(),
-            vk::KhrVulkanMemoryModelFn::name().as_ptr(),
             // DLSS
             #[cfg(feature = "dlss")]
             {
@@ -172,55 +218,47 @@ impl Device {
             vk::NvxImageViewHandleFn::name().as_ptr(),
         ];
 
-        #[cfg(feature = "ray-tracing")]
-        {
-            device_extension_names_raw.extend(
-                [
-                    vk::KhrPipelineLibraryFn::name().as_ptr(),        // rt dep
-                    vk::KhrDeferredHostOperationsFn::name().as_ptr(), // rt dep
-                    vk::KhrBufferDeviceAddressFn::name().as_ptr(),    // rt dep
-                    vk::KhrAccelerationStructureFn::name().as_ptr(),
-                    vk::KhrRayTracingPipelineFn::name().as_ptr(),
-                    //vk::KhrRayQueryFn::name().as_ptr(),
-                ]
-                .iter(),
-            );
+        let ray_tracing_extensions = [
+            vk::KhrVulkanMemoryModelFn::name().as_ptr(), // used in ray tracing shaders
+            vk::KhrPipelineLibraryFn::name().as_ptr(),   // rt dep
+            vk::KhrDeferredHostOperationsFn::name().as_ptr(), // rt dep
+            vk::KhrBufferDeviceAddressFn::name().as_ptr(), // rt dep
+            vk::KhrAccelerationStructureFn::name().as_ptr(),
+            vk::KhrRayTracingPipelineFn::name().as_ptr(),
+        ];
+
+        let ray_tracing_enabled = unsafe {
+            ray_tracing_extensions.iter().all(|ext| {
+                let ext = std::ffi::CStr::from_ptr(*ext).to_string_lossy();
+
+                let supported = supported_extensions.contains(ext.as_ref());
+
+                if !supported {
+                    log::info!("Ray tracing extension not supported: {}", ext);
+                }
+
+                supported
+            })
+        };
+
+        if ray_tracing_enabled {
+            log::info!("All ray tracing extensions are supported");
+
+            device_extension_names.extend(ray_tracing_extensions.iter());
         }
 
         if pdevice.presentation_requested {
-            device_extension_names_raw.push(khr::Swapchain::name().as_ptr());
+            device_extension_names.push(khr::Swapchain::name().as_ptr());
         }
 
-        device_extension_names_raw
-    }
-
-    pub fn create(pdevice: &Arc<PhysicalDevice>) -> Result<Arc<Self>> {
-        let device_extension_names = Self::extension_names(pdevice);
-
         unsafe {
-            let extension_properties = pdevice
-                .instance
-                .raw
-                .enumerate_device_extension_properties(pdevice.raw)?;
-            debug!("Extension properties:\n{:#?}", &extension_properties);
-
-            let supported_extensions: HashSet<String> = extension_properties
-                .iter()
-                .map(|ext| {
-                    std::ffi::CStr::from_ptr(ext.extension_name.as_ptr() as *const c_char)
-                        .to_string_lossy()
-                        .as_ref()
-                        .to_owned()
-                })
-                .collect();
-
             for &ext in &device_extension_names {
                 let ext = std::ffi::CStr::from_ptr(ext).to_string_lossy();
                 if !supported_extensions.contains(ext.as_ref()) {
                     panic!("Device extension not supported: {}", ext);
                 }
             }
-        };
+        }
 
         let priorities = [1.0];
 
@@ -251,11 +289,9 @@ impl Device {
         let mut get_buffer_device_address_features =
             ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
 
-        #[cfg(feature = "ray-tracing")]
         let mut acceleration_structure_features =
             ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
 
-        #[cfg(feature = "ray-tracing")]
         let mut ray_tracing_pipeline_features =
             ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
 
@@ -270,8 +306,7 @@ impl Device {
                 .push_next(&mut vulkan_memory_model)
                 .push_next(&mut get_buffer_device_address_features);
 
-            #[cfg(feature = "ray-tracing")]
-            {
+            if ray_tracing_enabled {
                 features2 = features2
                     .push_next(&mut acceleration_structure_features)
                     .push_next(&mut ray_tracing_pipeline_features);
@@ -298,9 +333,7 @@ impl Device {
 
                 assert!(descriptor_indexing.shader_uniform_texel_buffer_array_dynamic_indexing != 0);
                 assert!(descriptor_indexing.shader_storage_texel_buffer_array_dynamic_indexing != 0);
-                assert!(descriptor_indexing.shader_uniform_buffer_array_non_uniform_indexing != 0);
                 assert!(descriptor_indexing.shader_sampled_image_array_non_uniform_indexing != 0);
-                assert!(descriptor_indexing.shader_storage_buffer_array_non_uniform_indexing != 0);
                 assert!(descriptor_indexing.shader_storage_image_array_non_uniform_indexing != 0);
                 assert!(descriptor_indexing.shader_uniform_texel_buffer_array_non_uniform_indexing != 0);
                 assert!(descriptor_indexing.shader_storage_texel_buffer_array_non_uniform_indexing != 0);
@@ -314,18 +347,20 @@ impl Device {
 
                 assert!(shader_float16_int8.shader_int8 != 0);
 
-                assert!(vulkan_memory_model.vulkan_memory_model != 0);
+                if ray_tracing_enabled {
+                    assert!(descriptor_indexing.shader_uniform_buffer_array_non_uniform_indexing != 0);
+                    assert!(descriptor_indexing.shader_storage_buffer_array_non_uniform_indexing != 0);
 
-                #[cfg(feature = "ray-tracing")]
-                {
+                    assert!(vulkan_memory_model.vulkan_memory_model != 0);
+
                     assert!(acceleration_structure_features.acceleration_structure != 0);
                     assert!(acceleration_structure_features.descriptor_binding_acceleration_structure_update_after_bind != 0);
 
                     assert!(ray_tracing_pipeline_features.ray_tracing_pipeline != 0);
                     assert!(ray_tracing_pipeline_features.ray_tracing_pipeline_trace_rays_indirect != 0);
-                }
 
-                assert!(get_buffer_device_address_features.buffer_device_address != 0);
+                    assert!(get_buffer_device_address_features.buffer_device_address != 0);
+                }
             }
 
             let device_create_info = vk::DeviceCreateInfo::builder()
@@ -358,8 +393,18 @@ impl Device {
                 family: universal_queue,
             };
 
-            let frame0 = DeviceFrame::new(&device, &mut global_allocator, &universal_queue.family);
-            let frame1 = DeviceFrame::new(&device, &mut global_allocator, &universal_queue.family);
+            let frame0 = DeviceFrame::new(
+                pdevice,
+                &device,
+                &mut global_allocator,
+                &universal_queue.family,
+            );
+            let frame1 = DeviceFrame::new(
+                pdevice,
+                &device,
+                &mut global_allocator,
+                &universal_queue.family,
+            );
             //let frame2 = DeviceFrame::new(&device, &mut global_allocator, &universal_queue.family);
 
             let immutable_samplers = Self::create_samplers(&device);
@@ -373,6 +418,13 @@ impl Device {
             let ray_tracing_pipeline_properties =
                 khr::RayTracingPipeline::get_properties(&pdevice.instance.raw, pdevice.raw);
 
+            let crash_tracking_buffer = Self::create_buffer_impl(
+                &device,
+                &mut global_allocator,
+                BufferDesc::new_gpu_to_cpu(4, vk::BufferUsageFlags::TRANSFER_DST),
+                "crash tracking buffer",
+            )?;
+
             Ok(Arc::new(Device {
                 pdevice: pdevice.clone(),
                 instance: pdevice.instance.clone(),
@@ -381,6 +433,8 @@ impl Device {
                 global_allocator: Arc::new(Mutex::new(global_allocator)),
                 immutable_samplers,
                 setup_cb: Mutex::new(setup_cb),
+                crash_tracking_buffer,
+                crash_marker_names: Default::default(),
                 acceleration_structure_ext,
                 ray_tracing_pipeline_ext,
                 // ray_query_ext,
@@ -390,6 +444,7 @@ impl Device {
                     Mutex::new(Arc::new(frame1)),
                     //Mutex::new(Arc::new(frame2)),
                 ],
+                ray_tracing_enabled,
             }))
         }
     }
@@ -478,25 +533,8 @@ impl Device {
                         true,
                         std::u64::MAX,
                     )
+                    .map_err(|err| self.report_error(err.into()))
                     .expect("Wait for fence failed.");
-            }
-
-            // Report GPU timings
-            {
-                puffin::profile_scope!("retrieve GPU timers");
-
-                let (query_ids, timing_pairs) = frame0.profiler_data.retrieve_previous_result();
-
-                let ns_per_tick = self.pdevice.properties.limits.timestamp_period;
-
-                crate::gpu_profiler::report_durations_ticks(
-                    ns_per_tick,
-                    timing_pairs.chunks_exact(2).enumerate().map(
-                        |(pair_idx, chunk)| -> (crate::gpu_profiler::GpuProfilerQueryId, u64) {
-                            (query_ids[pair_idx], chunk[1] - chunk[0])
-                        },
-                    ),
-                );
             }
 
             puffin::profile_scope!("release pending resources");
@@ -513,7 +551,10 @@ impl Device {
         resource.enqueue_release(&mut self.frames[0].lock().pending_resource_releases.lock());
     }
 
-    pub fn with_setup_cb(&self, callback: impl FnOnce(vk::CommandBuffer)) {
+    pub fn with_setup_cb(
+        &self,
+        callback: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<(), BackendError> {
         let cb = self.setup_cb.lock();
 
         unsafe {
@@ -543,7 +584,8 @@ impl Device {
                 .expect("queue submit failed.");
 
             log::trace!("device_wait_idle");
-            self.raw.device_wait_idle().unwrap();
+
+            Ok(self.raw.device_wait_idle()?)
         }
     }
 
@@ -573,6 +615,20 @@ impl Device {
 
     pub fn debug_utils(&self) -> Option<&DebugUtils> {
         self.instance.debug_utils.as_ref()
+    }
+
+    pub fn max_bindless_descriptor_count(&self) -> u32 {
+        (512 * 1024).min(
+            self.pdevice
+                .properties
+                .limits
+                .max_per_stage_descriptor_sampled_images
+                - RESERVED_DESCRIPTOR_COUNT,
+        )
+    }
+
+    pub fn ray_tracing_enabled(&self) -> bool {
+        self.ray_tracing_enabled
     }
 }
 

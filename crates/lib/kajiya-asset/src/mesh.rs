@@ -32,9 +32,28 @@ pub enum TexGamma {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum TexCompressionMode {
+    None,
+    Rgba,
+    Rg,
+}
+
+impl TexCompressionMode {
+    pub fn supports_alpha(&self) -> bool {
+        match self {
+            TexCompressionMode::None => true,
+            TexCompressionMode::Rgba => true,
+            TexCompressionMode::Rg => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct TexParams {
     pub gamma: TexGamma,
     pub use_mips: bool,
+    pub compression: TexCompressionMode,
+    pub channel_swizzle: Option<[usize; 4]>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -124,8 +143,11 @@ fn load_gltf_material(
         }
     }
 
-    let (albedo_map, albedo_map_transform) =
-        mat.pbr_metallic_roughness().base_color_texture().map_or(
+    let (albedo_map, albedo_map_transform) = mat
+        .pbr_metallic_roughness()
+        .base_color_texture()
+        .or_else(|| mat.pbr_specular_glossiness()?.diffuse_texture())
+        .map_or(
             (
                 MeshMaterialMap::Placeholder([255, 255, 255, 255]),
                 DEFAULT_MAP_TRANSFORM,
@@ -139,6 +161,8 @@ fn load_gltf_material(
                         params: TexParams {
                             gamma: TexGamma::Srgb,
                             use_mips: true,
+                            compression: TexCompressionMode::Rgba,
+                            channel_swizzle: None,
                         },
                     },
                     transform,
@@ -157,6 +181,8 @@ fn load_gltf_material(
                     params: TexParams {
                         gamma: TexGamma::Linear,
                         use_mips: true,
+                        compression: TexCompressionMode::Rg,
+                        channel_swizzle: None,
                     },
                 }
             });
@@ -169,7 +195,7 @@ fn load_gltf_material(
                 let roughness = 255;
                 let metalness = 255;
                 (
-                    MeshMaterialMap::Placeholder([127, roughness, metalness, 255]),
+                    MeshMaterialMap::Placeholder([roughness, metalness, 127, 255]),
                     DEFAULT_MAP_TRANSFORM,
                 )
             },
@@ -180,6 +206,8 @@ fn load_gltf_material(
                         params: TexParams {
                             gamma: TexGamma::Linear,
                             use_mips: true,
+                            compression: TexCompressionMode::Rg,
+                            channel_swizzle: Some([1, 2, 0, 3]),
                         },
                     },
                     texture_transform_to_matrix(tex.texture_transform()),
@@ -195,8 +223,10 @@ fn load_gltf_material(
         emissive_map = MeshMaterialMap::Image {
             source: document_images[tex.texture().source().index()].clone(),
             params: TexParams {
-                gamma: TexGamma::Linear,
+                gamma: TexGamma::Srgb,
                 use_mips: true,
+                compression: TexCompressionMode::Rgba,
+                channel_swizzle: None,
             },
         }
     }
@@ -289,17 +319,18 @@ impl LazyWorker for LoadGltfScene {
                         };
 
                         // Collect tangents (optional)
-                        let tangents = if let Some(iter) = reader.read_tangents() {
-                            iter.collect::<Vec<_>>()
-                        } else {
-                            vec![[1.0, 0.0, 0.0, 0.0]; positions.len()]
-                        };
+                        let (mut tangents, tangents_found) =
+                            if let Some(iter) = reader.read_tangents() {
+                                (iter.collect::<Vec<_>>(), true)
+                            } else {
+                                (vec![[1.0, 0.0, 0.0, 0.0]; positions.len()], false)
+                            };
 
                         // Collect uvs (optional)
-                        let mut uvs = if let Some(iter) = reader.read_tex_coords(0) {
-                            iter.into_f32().collect::<Vec<_>>()
+                        let (mut uvs, uvs_found) = if let Some(iter) = reader.read_tex_coords(0) {
+                            (iter.into_f32().collect::<Vec<_>>(), true)
                         } else {
-                            vec![[0.0, 0.0]; positions.len()]
+                            (vec![[0.0, 0.0]; positions.len()], false)
                         };
 
                         // Collect colors (optional)
@@ -312,19 +343,27 @@ impl LazyWorker for LoadGltfScene {
                         // Collect material ids
                         let mut material_ids = vec![res_material_index; positions.len()];
 
-                        // --------------------------------------------------------
-                        // Write it all to the output
-
+                        // Collect indices
+                        let mut indices: Vec<u32>;
                         {
-                            let mut indices: Vec<u32>;
-                            let base_index = res.positions.len() as u32;
-
                             if let Some(indices_reader) = reader.read_indices() {
-                                indices =
-                                    indices_reader.into_u32().map(|i| i + base_index).collect();
+                                indices = indices_reader.into_u32().collect();
                             } else {
-                                indices =
-                                    (base_index..(base_index + positions.len() as u32)).collect();
+                                if positions.is_empty() {
+                                    return;
+                                }
+
+                                match prim.mode() {
+                                    gltf::mesh::Mode::Triangles => {
+                                        indices = (0..positions.len() as u32).collect();
+                                    }
+                                    _ => {
+                                        panic!(
+                                            "Primitive mode {:?} not supported yet",
+                                            prim.mode()
+                                        );
+                                    }
+                                }
                             }
 
                             if flip_winding_order {
@@ -332,8 +371,31 @@ impl LazyWorker for LoadGltfScene {
                                     tri.swap(0, 2);
                                 }
                             }
+                        }
 
+                        if !tangents_found && uvs_found {
+                            log::trace!(
+                                "Mesh had UVs but no tangents. Calculating the tangents..."
+                            );
+
+                            mikktspace::generate_tangents(&mut TangentCalcContext {
+                                indices: indices.as_slice(),
+                                positions: positions.as_slice(),
+                                normals: normals.as_slice(),
+                                uvs: uvs.as_slice(),
+                                tangents: tangents.as_mut_slice(),
+                            });
+                        }
+
+                        // --------------------------------------------------------
+                        // Write it all to the output
+
+                        {
                             // log::info!("Loading a mesh with {} indices", indices.len());
+                            let base_index = res.positions.len() as u32;
+                            for i in &mut indices {
+                                *i += base_index;
+                            }
 
                             res.indices.append(&mut indices);
                             res.colors.append(&mut colors);
@@ -785,6 +847,8 @@ pub fn pack_triangle_mesh(mesh: &TriangleMesh) -> PackedTriangleMesh {
                     TexParams {
                         gamma: crate::mesh::TexGamma::Linear,
                         use_mips: false,
+                        compression: TexCompressionMode::None,
+                        channel_swizzle: None,
                     },
                 ),
             };
@@ -818,5 +882,39 @@ impl Default for GpuMaterial {
             base_color_mult: [0.0f32; 4],
             maps: [0; 4],
         }
+    }
+}
+
+struct TangentCalcContext<'a> {
+    indices: &'a [u32],
+    positions: &'a [[f32; 3]],
+    normals: &'a [[f32; 3]],
+    uvs: &'a [[f32; 2]],
+    tangents: &'a mut [[f32; 4]],
+}
+
+impl<'a> mikktspace::Geometry for TangentCalcContext<'a> {
+    fn num_faces(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+
+    fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.positions[self.indices[face * 3 + vert] as usize]
+    }
+
+    fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.normals[self.indices[face * 3 + vert] as usize]
+    }
+
+    fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+        self.uvs[self.indices[face * 3 + vert] as usize]
+    }
+
+    fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
+        self.tangents[self.indices[face * 3 + vert] as usize] = tangent;
     }
 }

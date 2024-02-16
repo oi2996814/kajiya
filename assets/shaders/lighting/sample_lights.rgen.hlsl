@@ -18,14 +18,7 @@
 [shader("raygeneration")]
 void main() {
     const uint2 px = DispatchRaysIndex().xy;
-    uint2 hi_px_subpixels[4] = {
-        uint2(0, 0),
-        uint2(1, 1),
-        uint2(1, 0),
-        uint2(0, 1),
-    };
-
-    const uint2 hi_px = px * 2 + hi_px_subpixels[frame_constants.frame_index & 3];
+    const uint2 hi_px = px * 2 + HALFRES_SUBSAMPLE_OFFSET;
     float depth = depth_tex[hi_px];
 
     if (0.0 == depth) {
@@ -61,7 +54,7 @@ void main() {
                 dist_to_light - 1e-4
         ));
 
-    out0_tex[px] = float4(is_shadowed ? 0 : triangle_light.radiance(), 1);
+    out0_tex[px] = float4(select(is_shadowed, 0, triangle_light.radiance(), 1));
     out1_tex[px] = float4(
         view_ray_context.ray_hit_vs() + direction_world_to_view(to_light_ws),
         light_sample.pdf.value * light_choice_pmf

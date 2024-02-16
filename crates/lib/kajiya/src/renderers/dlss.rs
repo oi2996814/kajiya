@@ -233,14 +233,18 @@ impl DlssRenderer {
             );
 
             let mut dlss_feature: *mut NVSDK_NGX_Handle = ptr::null_mut();
-            backend.device.with_setup_cb(|cb| {
-                ngx_checked!(NVSDK_NGX_VULKAN_CreateFeature(
-                    transmute(cb),
-                    NVSDK_NGX_Feature_NVSDK_NGX_Feature_SuperSampling,
-                    ngx_params,
-                    &mut dlss_feature,
-                ));
-            });
+            backend
+                .device
+                .with_setup_cb(|cb| {
+                    ngx_checked!(NVSDK_NGX_VULKAN_CreateFeature(
+                        transmute(cb),
+                        NVSDK_NGX_Feature_NVSDK_NGX_Feature_SuperSampling,
+                        ngx_params,
+                        &mut dlss_feature,
+                    ));
+                })
+                .map_err(|err| backend.device.report_error(err))
+                .expect("NVSDK_NGX_VULKAN_CreateFeature (DLSS) failed");
 
             Self {
                 dlss_feature,
@@ -359,6 +363,8 @@ impl DlssRenderer {
                 ngx_params,
                 dlss_eval_params
             ));
+
+            Ok(())
         });
 
         self.frame_idx += 1;
@@ -693,7 +699,7 @@ fn image_to_ngx<ViewType: rg::GpuViewType>(
     let device = api.device();
     let image = api.resources.image(image_ref);
 
-    let view = image.view(device, &view_desc);
+    let view = image.view(device, &view_desc).unwrap();
     let view_desc = image.view_desc(&view_desc);
 
     unsafe {

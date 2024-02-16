@@ -3,12 +3,15 @@ use std::cell::{Ref, RefCell};
 use kajiya_backend::Image;
 use kajiya_rg::{self as rg, GetOrCreateTemporal};
 
-pub mod csgi;
 pub mod deferred;
+pub mod dof;
 pub mod half_res;
+pub mod ibl;
+pub mod ircache;
 pub mod lighting;
 pub mod motion_blur;
 pub mod post;
+pub mod prefix_scan;
 pub mod raster_meshes;
 pub mod reference;
 pub mod reprojection;
@@ -19,6 +22,8 @@ pub mod shadows;
 pub mod sky;
 pub mod ssgi;
 pub mod taa;
+pub mod ussgi;
+pub mod wrc;
 
 #[cfg(feature = "dlss")]
 pub mod dlss;

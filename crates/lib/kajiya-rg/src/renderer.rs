@@ -6,7 +6,6 @@ use crate::{
 use kajiya_backend::{
     ash::vk,
     dynamic_constants::*,
-    gpu_allocator::MemoryLocation,
     pipeline_cache::*,
     rspirv_reflect,
     transient_resource_cache::TransientResourceCache,
@@ -87,20 +86,16 @@ pub struct FrameConstantsLayout {
 impl Renderer {
     pub fn new(backend: &RenderBackend) -> anyhow::Result<Self> {
         let dynamic_constants = DynamicConstants::new({
-            backend
-                .device
-                .create_buffer_impl(
-                    BufferDesc {
-                        size: DYNAMIC_CONSTANTS_SIZE_BYTES * DYNAMIC_CONSTANTS_BUFFER_COUNT,
-                        usage: vk::BufferUsageFlags::UNIFORM_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER
-                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                        mapped: true,
-                    },
-                    Default::default(),
-                    MemoryLocation::CpuToGpu,
-                )
-                .expect("a buffer for dynamic constants")
+            backend.device.create_buffer(
+                BufferDesc::new_cpu_to_gpu(
+                    DYNAMIC_CONSTANTS_SIZE_BYTES * DYNAMIC_CONSTANTS_BUFFER_COUNT,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER
+                        | vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                ),
+                "dynamic constants buffer",
+                None,
+            )?
         });
 
         let frame_descriptor_set =
@@ -165,7 +160,9 @@ impl Renderer {
         {
             let main_cb = &current_frame.main_command_buffer;
 
-            current_frame.profiler_data.begin_frame(device, main_cb.raw);
+            current_frame
+                .profiler_data
+                .begin_frame(&device.raw, main_cb.raw);
 
             executing_rg = {
                 puffin::profile_scope!("rg begin_execute");
@@ -189,7 +186,7 @@ impl Renderer {
 
                 {
                     puffin::profile_scope!("rg::record_main_cb");
-                    executing_rg.record_main_cb(main_cb);
+                    executing_rg.record_main_cb(main_cb)
                 }
 
                 raw_device.end_command_buffer(main_cb.raw).unwrap();
@@ -202,14 +199,17 @@ impl Renderer {
                     .reset_fences(std::slice::from_ref(&main_cb.submit_done_fence))
                     .expect("reset_fences");
 
-                puffin::profile_scope!("queue_submit");
+                puffin::profile_scope!("submit main cb");
+
+                // Try to submit the command buffer to the GPU. We might encounter a GPU crash.
                 raw_device
                     .queue_submit(
                         self.device.universal_queue.raw,
                         &submit_info,
                         main_cb.submit_done_fence,
                     )
-                    .expect("queue submit failed.");
+                    .map_err(|err| device.report_error(err.into()))
+                    .expect("main queue_submit failed");
             };
         }
 
@@ -257,7 +257,7 @@ impl Renderer {
 
             current_frame
                 .profiler_data
-                .finish_frame(device, presentation_cb.raw);
+                .end_frame(&device.raw, presentation_cb.raw);
 
             // Record and submit the presentation command buffer
             unsafe {
@@ -274,13 +274,16 @@ impl Renderer {
                 raw_device
                     .reset_fences(std::slice::from_ref(&presentation_cb.submit_done_fence))
                     .expect("reset_fences");
+
+                puffin::profile_scope!("submit presentation cb");
                 raw_device
                     .queue_submit(
                         self.device.universal_queue.raw,
                         &submit_info,
                         presentation_cb.submit_done_fence,
                     )
-                    .expect("queue submit failed.");
+                    .map_err(|err| device.report_error(err.into()))
+                    .expect("presentation queue_submit failed");
             }
 
             swapchain.present_image(swapchain_image);
@@ -396,18 +399,21 @@ impl Renderer {
                 .build();
 
             let descriptor_set_writes = [
+                // `frame_constants`
                 vk::WriteDescriptorSet::builder()
                     .dst_binding(0)
                     .dst_set(set)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                     .buffer_info(std::slice::from_ref(&uniform_buffer_info))
                     .build(),
+                // `instance_dynamic_parameters_dyn`
                 vk::WriteDescriptorSet::builder()
                     .dst_binding(1)
                     .dst_set(set)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
                     .buffer_info(std::slice::from_ref(&storage_buffer_info))
                     .build(),
+                // `triangle_lights_dyn`
                 vk::WriteDescriptorSet::builder()
                     .dst_binding(2)
                     .dst_set(set)

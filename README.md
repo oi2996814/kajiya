@@ -5,7 +5,7 @@
 <!-- markdownlint-disable-file MD033 -->
 
 <div align="center">
-   
+
 # 💡 kajiya
 
 **Experimental real-time global illumination renderer made with Rust and Vulkan**
@@ -29,12 +29,13 @@ _Ruins environment rendered in kajiya. [Scene](https://www.unrealengine.com/mark
 
 * Hybrid rendering using a mixture of raster, compute, and ray-tracing
 * Dynamic global illumination
-    * Multi-bounce temporally-recurrent voxel-based diffuse
-    * Short-range ray-traced diffuse for high-frequency details
-    * Single bounce specular, falling back to diffuse after the first hit
+  * Fully dynamic geometry and lighting without precomputation
+  * Volumetric temporally-recurrent irradiance cache for "infinite" bounces
+  * Ray-traced diffuse final gather for high-frequency details
+  * Ray-traced specular, falling back to diffuse after the first hit
 * Sun with ray-traced soft shadows
 * Standard PBR with GGX and roughness/metalness
-    * Energy-preserving multi-scattering BRDF
+  * Energy-preserving multi-scattering BRDF
 * Reference path-tracing mode
 * Temporal super-resolution and anti-aliasing
 * Natural tone mapping
@@ -42,63 +43,88 @@ _Ruins environment rendered in kajiya. [Scene](https://www.unrealengine.com/mark
 * Basic motion blur
 * Contrast-adaptive sharpening
 * Optional DLSS support
-* GLTF mesh loading (no animations yet)
+* glTF mesh loading (no animations yet)
 * A render graph running it all
 
-## Technical overview
+## Technical details
 
-* [A quick presentation](https://docs.google.com/presentation/d/1LWo5TtWUAH9d62sGY9Sjmu1JqIs8BsxLbVDxLuhhX8U/edit?usp=sharing) about the renderer
+* [Global illumination overview](docs/gi-overview.md)
 * Repository highlights:
   * HLSL shaders: [`assets/shaders/`](assets/shaders)
   * Rust shaders: [`crates/lib/rust-shaders/`](crates/lib/rust-shaders)
   * Main render graph passes: [`world_render_passes.rs`](crates/lib/kajiya/src/world_render_passes.rs)
-* Notable branches:
-  * `restir-meets-surfel` - latest experimental branch, with [new GI in the works](https://gist.github.com/h3r2tic/ba39300c2b2ca4d9ca5f6ff22350a037)
 
-## Platforms
+## Primary platforms
 
 `kajiya` currently works on a limited range of operating systems and hardware.
 
-
 Hardware:
+
 * Nvidia RTX series
-* Nvidia GTX 1060 and newer (slow: driver-emulated ray-tracing)
+* Nvidia GTX 1060 and newer _with 6+ GB of VRAM_ (slow: driver-emulated ray-tracing)
 * AMD Radeon RX 6000 series
 
 Operating systems:
+
 * Windows
 * Linux
 
+## Secondary Platforms
+
+`kajiya` has a rudimentary "RTX Off" mode which runs on a wider range of systems, but most of its visual features are disabled.
+
+Hardware:
+
+* Older GPUs with support for Vulkan 1.2
+
+Operating systems:
+
+* macOS
+
+## Dependencies
+
 ### (Some) Linux dependencies
-* `libtinfo5`
+
 * `uuid-dev`
-* In case the bundled `libdxcompiler.so` doesn't work: https://github.com/microsoft/DirectXShaderCompiler#downloads
+* In case the bundled `libdxcompiler.so` doesn't work: <https://github.com/microsoft/DirectXShaderCompiler#downloads>
+
+### (Some) MacOS dependencies
+
+* `ossp-uuid` (`brew install ossp-uuid`)
 
 ## Building and running
 
-There's a very minimal asset pipeline in `bake.rs`, which converts meshes from GLTF to an internal flat format, and calculates texture mips. In order to bake all the provided meshes, run:
+To build `kajiya` [you need Rust](https://www.rust-lang.org/tools/install).
 
-* Windows: `bake.cmd`
-* Linux: `./bake.sh`
-
-When done, run the renderer demo (`view` app from `crates/bin/view`) via:
-
-* Windows: `build_and_run.cmd [scene_name]`
-* Linux: `./build_and_run.sh [scene_name]`
-
-Where `[scene_name]` is one of the file names in `assets/scenes`, without the `.ron` extension, e.g.:
+Once Rust is installed, open a command prompt in the project folder, then build and run the viewer app via:
 
 ```
-build_and_run.cmd battle
+cargo run --bin view --release
 ```
 
-or
+This will compile a binary in the `target/release` folder, and then run it.
+
+For a list of supported command-line switches see `--help`. In order to pass it through `cargo` to the renderer, you need to separate the `cargo` arguments from `view` arguments using `--` e.g.:
 
 ```
-cargo run --bin view --release -- --scene battle --width 1920 --height 1080 --no-debug
+cargo run --bin view --release -- --help
 ```
 
-### Controls in the `view` app
+## Loading assets
+
+`kajiya` supports meshes in the [glTF 2.0](https://github.com/KhronosGroup/glTF) format, and also has its own tiny [RON](https://github.com/ron-rs/ron)-based scene format which can refer to multiple glTF 2.0 meshes.
+
+To load either, simply drag-n-drop the `.gltf`, `.glb`, or `.ron` file onto the window of the `view` app. See the `assets/` folder for a few bundled examples.
+
+The first time a mesh is loaded, it is converted to a runtime format: the vertices are packed, and textures are compressed. The next time the same mesh is used, it's loaded from the `cache/` folder.
+
+Please note that only the roughness-metalness workflow in glTF is supported. In Blender that corresponds to _Principled BSDF_.
+
+`kajiya` can also load image-based lights ([examples](http://www.hdrlabs.com/sibl/archive.html)). To do so, drag-n-drop an `.exr` or `.hdr` file onto window of the `view` app.
+
+The loaded assets can be manipulated in the `Scene` section of the UI. The app state is persisted in `view_state.ron`.
+
+## Controls in the `view` app
 
 * WSAD, QE - movement
 * Mouse + RMB - rotate the camera
@@ -106,41 +132,22 @@ cargo run --bin view --release -- --scene battle --width 1920 --height 1080 --no
 * Shift - move faster
 * Ctrl - move slower
 * Space - switch to reference path tracing
-* Backspace - reset view to previous saved state
 * Tab - show/hide the UI
 
-### Resolution scaling
+## Resolution scaling
 
-#### DPI
+### DPI
 
 For the `view` app, DPI scaling in the operating system affects the physical number of pixels of the rendering output. The `--width` and `--height` parameters correspond to _logical_ window size **and** the internal rendering resolution. Suppose the OS uses DPI scaling of `1.5`, and the app is launched with `--width 1000`, the actual physical width of the window will be `1500` px. Rendering will still happen at `1000` px, with upscaling to `1500` px at the very end, via a Catmull-Rom kernel.
 
-#### Temporal upsampling
+### Temporal upsampling
 
 `kajiya` can also render at a reduced internal resolution, and reconstruct a larger image via temporal upsampling, trading quality for performance. A custom temporal super-resolution algorithm is used by default, and [DLSS is supported](docs/using-dlss.md) on some platforms. Both approaches result in better quality than what could be achieved by simply spatially scaling up the image at the end.
 
 For example, `--width 1920 --height 1080 --temporal-upsampling 1.5` will produce a `1920x1080` image by upsampling by a factor of `1.5` from `1280x720`. Most of the rendering will then happen with `1.5 * 1.5 = 2.25` times fewer pixels, resulting in an _almost_ 2x speedup.
 
-## Adding Meshes and Scenes
-
-To add new mesh(es), open `bake.cmd` (Win) / `bake.sh` (Linux), and add
-
-* cargo run --bin bake --release -- --scene "[path]" --scale 1.0 -o [mesh_name]
-
-To add new scenes, in `\assets\scenes`, create a `[scene_name].ron` with the following content:
-
-```
-(
-    instances: [
-        (
-            position: (0, 0, 0),
-            mesh: "[mesh_name]",
-        ),
-    ]
-)
-```
-
 ## Technical guides
+
 * [Using DLSS](docs/using-dlss.md)
 * [Working on Rust shaders](docs/rust-shaders.md)
 * [Using `kajiya` as a crate](docs/using-kajiya.md)
@@ -150,9 +157,6 @@ To add new scenes, in `\assets\scenes`, create a `[scene_name].ron` with the fol
 * Vulkan API usage is extremely basic. Resources are usually not released, and barriers aren't optimal.
 * There are hard limit on mesh data and instance counts. Exceeding those limits will result in panics and Vulkan validation errors / driver crashes.
 * Window (framebuffer) resizing is not yet implemented.
-* The voxel GI uses a fixed-size volume around the origin by default.
-    * Use `--gi-volume-scale` to change its extent in the `view` app
-    * It can be configured to use camera-centered cascades at an extra performance cost (see `CASCADE_COUNT` and `SCROLL_CASCADES` in [`csgi.rs`](../crates/lib/kajiya/src/renderers/csgi.rs`))
 * Denoising needs more work (always).
 
 ## Acknowledgments
@@ -161,7 +165,7 @@ This project is made possible by the awesome open source Rust community, and ben
 
 Special shout-outs go to:
 
-* Felix Westin for his [MinimalAtmosphere](https://github.com/Fewes/MinimalAtmosphere), which this project uses for sky rendering
+* Felix Westin for his [MinimalAtmosphere](https://github.com/Fewes/MinimalAtmosphere), which this project uses for sky rendering.
 * AMD, especially Dominik Baumeister and Guillaume Boissé for the [FidelityFX Shadow Denoiser](https://gpuopen.com/fidelityfx-denoiser/), which forms the basis of shadow denoising in `kajiya`.
 * Maik Klein for the Vulkan wrapper [ash](https://github.com/MaikKlein/ash), making it easy for `kajiya` to talk to the GPU.
 * Traverse Research and Jasper Bekkers for a number of highly relevant crates:
@@ -169,6 +173,7 @@ Special shout-outs go to:
   * SPIR-V reflection utilities: [rspirv-reflect](https://github.com/Traverse-Research/rspirv-reflect)
   * Vulkan memory management: [gpu-allocator](https://github.com/Traverse-Research/gpu-allocator)
   * Blue noise sampling: [blue-noise-sampler](https://github.com/Jasper-Bekkers/blue-noise-sampler)
+* Troy Sobotka for guidance and mind-bending discussions about color.
 
 ## Contribution
 

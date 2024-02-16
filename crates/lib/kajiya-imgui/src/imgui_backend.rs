@@ -43,7 +43,7 @@ impl ImGuiBackend {
         {
             use imgui::{FontConfig, FontGlyphRanges, FontSource};
 
-            let hidpi_factor = imgui_platform.hidpi_factor();
+            let hidpi_factor = window.scale_factor();
             let font_size = (13.0 * hidpi_factor) as f32;
             imgui.fonts().add_font(&[
                 FontSource::DefaultFontData {
@@ -62,8 +62,6 @@ impl ImGuiBackend {
                     }),
                 },
             ]);
-
-            imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
         }
 
         let imgui_renderer = {
@@ -161,6 +159,8 @@ impl ImGuiBackend {
                     .lock()
                     .render(gui_extent, ui_draw_data, device, cb)
                     .expect("ui.render");
+
+                Ok(())
             }),
             ui_target_image,
         ));
@@ -322,7 +322,7 @@ fn create_imgui_framebuffer(
         )
         .unwrap();
 
-    let framebuffer_attachments = [tex.view(device, &ImageViewDesc::default())];
+    let framebuffer_attachments = [tex.view(device, &ImageViewDesc::default()).unwrap()];
     let frame_buffer_create_info = vk::FramebufferCreateInfo::builder()
         .render_pass(render_pass)
         .attachments(&framebuffer_attachments)

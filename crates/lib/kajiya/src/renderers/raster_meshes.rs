@@ -49,7 +49,7 @@ pub fn raster_meshes(
         ],
         RasterPipelineDesc::builder()
             .render_pass(render_pass.clone())
-            .face_cull(true)
+            .face_cull(false)
             .push_constants_bytes(2 * std::mem::size_of::<u32>()),
     );
 
@@ -77,41 +77,41 @@ pub fn raster_meshes(
         let instance_transforms_offset =
             api.dynamic_constants()
                 .push_from_iter(instances.iter().map(|inst| {
-                    let transform: [f32; 12] = [
-                        inst.rotation.x_axis.x,
-                        inst.rotation.y_axis.x,
-                        inst.rotation.z_axis.x,
-                        inst.position.x,
-                        inst.rotation.x_axis.y,
-                        inst.rotation.y_axis.y,
-                        inst.rotation.z_axis.y,
-                        inst.position.y,
-                        inst.rotation.x_axis.z,
-                        inst.rotation.y_axis.z,
-                        inst.rotation.z_axis.z,
-                        inst.position.z,
+                    let transform = [
+                        inst.transform.x_axis.x,
+                        inst.transform.y_axis.x,
+                        inst.transform.z_axis.x,
+                        inst.transform.translation.x,
+                        inst.transform.x_axis.y,
+                        inst.transform.y_axis.y,
+                        inst.transform.z_axis.y,
+                        inst.transform.translation.y,
+                        inst.transform.x_axis.z,
+                        inst.transform.y_axis.z,
+                        inst.transform.z_axis.z,
+                        inst.transform.translation.z,
                     ];
 
-                    let prev_transform: [f32; 12] = [
-                        inst.prev_rotation.x_axis.x,
-                        inst.prev_rotation.y_axis.x,
-                        inst.prev_rotation.z_axis.x,
-                        inst.prev_position.x,
-                        inst.prev_rotation.x_axis.y,
-                        inst.prev_rotation.y_axis.y,
-                        inst.prev_rotation.z_axis.y,
-                        inst.prev_position.y,
-                        inst.prev_rotation.x_axis.z,
-                        inst.prev_rotation.y_axis.z,
-                        inst.prev_rotation.z_axis.z,
-                        inst.prev_position.z,
+                    let prev_transform = [
+                        inst.prev_transform.x_axis.x,
+                        inst.prev_transform.y_axis.x,
+                        inst.prev_transform.z_axis.x,
+                        inst.prev_transform.translation.x,
+                        inst.prev_transform.x_axis.y,
+                        inst.prev_transform.y_axis.y,
+                        inst.prev_transform.z_axis.y,
+                        inst.prev_transform.translation.y,
+                        inst.prev_transform.x_axis.z,
+                        inst.prev_transform.y_axis.z,
+                        inst.prev_transform.z_axis.z,
+                        inst.prev_transform.translation.z,
                     ];
 
                     (transform, prev_transform)
                 }));
 
         api.begin_render_pass(
-            &*render_pass,
+            &render_pass,
             [width, height],
             &[
                 (geometric_normal_ref, &ImageViewDesc::default()),
@@ -125,7 +125,7 @@ pub fn raster_meshes(
                     .build()
                     .unwrap(),
             )),
-        );
+        )?;
 
         api.set_default_view_and_scissor([width, height]);
 
@@ -139,7 +139,7 @@ pub fn raster_meshes(
                     )],
                 )
                 .raw_descriptor_set(1, bindless_descriptor_set),
-        );
+        )?;
 
         unsafe {
             let raw_device = &api.device().raw;
@@ -172,5 +172,7 @@ pub fn raster_meshes(
         }
 
         api.end_render_pass();
+
+        Ok(())
     });
 }

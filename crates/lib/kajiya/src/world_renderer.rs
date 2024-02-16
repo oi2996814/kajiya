@@ -1,20 +1,25 @@
 use crate::{
-    bindless_descriptor_set::{create_bindless_descriptor_set, BINDLESS_DESCRIPTOR_SET_LAYOUT},
+    bindless_descriptor_set::{
+        create_bindless_descriptor_set, BINDLESS_DESCRIPTOR_SET_LAYOUT,
+        BINDLESS_TEXURES_BINDING_INDEX,
+    },
     buffer_builder::BufferBuilder,
     frame_desc::WorldFrameDesc,
     image_lut::{ComputeImageLut, ImageLut},
     renderers::{
-        csgi::CsgiRenderer, lighting::LightingRenderer, raster_meshes::*, rtdgi::RtdgiRenderer,
-        rtr::*, shadow_denoise::ShadowDenoiseRenderer, ssgi::*, taa::TaaRenderer,
+        ibl::IblRenderer, ircache::IrcacheRenderer, lighting::LightingRenderer,
+        post::PostProcessRenderer, raster_meshes::*, rtdgi::RtdgiRenderer, rtr::*,
+        shadow_denoise::ShadowDenoiseRenderer, ssgi::*, taa::TaaRenderer,
     },
 };
-use glam::{Mat3, Quat, Vec2, Vec3};
+use glam::{Affine3A, Vec2, Vec3};
 use kajiya_asset::mesh::{AssetRef, GpuImage, MeshMaterialFlags, PackedTriMesh, PackedVertex};
 use kajiya_backend::{
     ash::vk::{self, ImageView},
     dynamic_constants::DynamicConstants,
     vk_sync::{self, AccessType},
     vulkan::{self, device, image::*, ray_tracing::*, shader::*, RenderBackend},
+    BackendError,
 };
 use kajiya_rg::{self as rg};
 #[allow(unused_imports)]
@@ -23,11 +28,14 @@ use parking_lot::Mutex;
 use rg::renderer::FrameConstantsLayout;
 use rust_shaders_shared::{
     camera::CameraMatrices,
-    frame_constants::{FrameConstants, GiCascadeConstants, MAX_CSGI_CASCADE_COUNT},
+    frame_constants::{FrameConstants, IrcacheCascadeConstants, IRCACHE_CASCADE_COUNT},
+    render_overrides::RenderOverrides,
     view_constants::ViewConstants,
 };
 use std::{collections::HashMap, mem::size_of, sync::Arc};
 use vulkan::buffer::{Buffer, BufferDesc};
+
+const USE_TAA_JITTER: bool = true;
 
 #[cfg(feature = "dlss")]
 use crate::renderers::dlss::DlssRenderer;
@@ -51,8 +59,22 @@ pub struct MeshHandle(pub usize);
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct InstanceHandle(pub usize);
 
+impl InstanceHandle {
+    pub const INVALID: InstanceHandle = InstanceHandle(!0);
+
+    pub fn is_valid(&self) -> bool {
+        *self != Self::INVALID
+    }
+}
+
+impl Default for InstanceHandle {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
 const MAX_GPU_MESHES: usize = 1024;
-const VERTEX_BUFFER_CAPACITY: usize = 1024 * 1024 * 512;
+const VERTEX_BUFFER_CAPACITY: usize = 1024 * 1024 * 1024;
 const TLAS_PREALLOCATE_BYTES: usize = 1024 * 1024 * 32;
 
 #[derive(Clone, Copy)]
@@ -70,10 +92,8 @@ impl Default for InstanceDynamicParameters {
 
 #[derive(Clone, Copy)]
 pub struct MeshInstance {
-    pub rotation: Mat3,
-    pub position: Vec3,
-    pub prev_rotation: Mat3,
-    pub prev_position: Vec3,
+    pub transform: Affine3A,
+    pub prev_transform: Affine3A,
     pub mesh: MeshHandle,
     pub dynamic_parameters: InstanceDynamicParameters,
 }
@@ -81,8 +101,7 @@ pub struct MeshInstance {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RenderDebugMode {
     None,
-    CsgiVoxelGrid { cascade_idx: usize },
-    CsgiRadiance,
+    WorldRadianceCache,
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +169,7 @@ pub struct WorldRenderer {
     bindless_images: Vec<Arc<Image>>,
     next_bindless_image_id: usize,
     next_instance_handle: usize,
+    bindless_texture_sizes: Buffer,
 
     image_luts: Vec<ImageLut>,
     frame_idx: u32,
@@ -162,13 +182,15 @@ pub struct WorldRenderer {
     pub render_mode: RenderMode,
     pub reset_reference_accumulation: bool,
 
+    pub post: PostProcessRenderer,
     pub ssgi: SsgiRenderer,
     pub rtr: RtrRenderer,
     pub lighting: LightingRenderer,
+    pub ircache: IrcacheRenderer,
     pub rtdgi: RtdgiRenderer,
-    pub csgi: CsgiRenderer,
     pub taa: TaaRenderer,
     pub shadow_denoise: ShadowDenoiseRenderer,
+    pub ibl: IblRenderer,
 
     #[cfg(feature = "dlss")]
     pub dlss: DlssRenderer,
@@ -177,18 +199,96 @@ pub struct WorldRenderer {
 
     pub debug_mode: RenderDebugMode,
     pub debug_shading_mode: usize,
+    pub debug_show_wrc: bool,
     pub ev_shift: f32,
+    pub dynamic_exposure: DynamicExposureState,
+    pub contrast: f32,
 
-    pub world_gi_scale: f32,
     pub sun_size_multiplier: f32,
     pub sun_color_multiplier: Vec3,
     pub sky_ambient: Vec3,
+
+    pub render_overrides: RenderOverrides,
+
+    // One for each render mode
+    pub(crate) exposure_state: [ExposureState; 2],
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy)]
+pub struct HistogramClipping {
+    pub low: f32,
+    pub high: f32,
+}
+
+#[derive(Default)]
+pub struct DynamicExposureState {
+    pub enabled: bool,
+    pub speed_log2: f32,
+    pub histogram_clipping: HistogramClipping,
+
+    ev_fast: f32,
+    ev_slow: f32,
+}
+
+const DYNAMIC_EXPOSURE_BIAS: f32 = -2.0;
+
+impl DynamicExposureState {
+    pub fn ev_smoothed(&self) -> f32 {
+        if self.enabled {
+            (self.ev_slow + self.ev_fast) * 0.5 + DYNAMIC_EXPOSURE_BIAS
+        } else {
+            0.0
+        }
+    }
+
+    pub fn update(&mut self, ev: f32, dt: f32) {
+        if !self.enabled {
+            return;
+        }
+
+        let ev = ev.clamp(-16.0, 16.0);
+
+        let dt = dt * self.speed_log2.exp2();
+
+        let t_fast = 1.0 - (-1.0 * dt).exp();
+        self.ev_fast = (ev - self.ev_fast) * t_fast + self.ev_fast;
+
+        let t_slow = 1.0 - (-0.25 * dt).exp();
+        self.ev_slow = (ev - self.ev_slow) * t_slow + self.ev_slow;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ExposureState {
+    /// A value to multiply all lighting by in order to apply exposure compensation
+    /// early in the pipeline, such that lighting values fit in small texture formats.
+    pub pre_mult: f32,
+
+    /// The remaining multiplier to apply in post.
+    pub post_mult: f32,
+
+    // The pre-multiplier in the previous frame.
+    pub pre_mult_prev: f32,
+
+    // `pre_mult / pre_mult_prev`
+    pub pre_mult_delta: f32,
+}
+
+impl Default for ExposureState {
+    fn default() -> Self {
+        Self {
+            pre_mult: 1.0,
+            post_mult: 1.0,
+            pre_mult_prev: 1.0,
+            pre_mult_delta: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RenderMode {
-    Standard,
-    Reference,
+    Standard = 0,
+    Reference = 1,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -199,7 +299,7 @@ fn load_gpu_image_asset(
     asset: AssetRef<GpuImage::Flat>,
 ) -> Arc<Image> {
     let asset = crate::mmap::mmapped_asset::<GpuImage::Flat, _>(&format!(
-        "/baked/{:8.8x}.image",
+        "/cache/{:8.8x}.image",
         asset.identity()
     ))
     .unwrap();
@@ -244,9 +344,9 @@ impl WorldRenderer {
         #[allow(unused_variables)] render_extent: [u32; 2],
         temporal_upscale_extent: [u32; 2],
         backend: &RenderBackend,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, BackendError> {
         let raster_simple_render_pass = create_render_pass(
-            &*backend.device,
+            &backend.device,
             RenderPassDesc {
                 color_attachments: &[
                     // view-space geometry normal; * 2 - 1 to decode
@@ -259,38 +359,46 @@ impl WorldRenderer {
                 ],
                 depth_attachment: Some(RenderPassAttachmentDesc::new(vk::Format::D32_SFLOAT)),
             },
+        );
+
+        let mesh_buffer = backend.device.create_buffer(
+            BufferDesc::new_cpu_to_gpu(
+                MAX_GPU_MESHES * size_of::<GpuMesh>(),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            ),
+            "mesh buffer",
+            None,
         )?;
 
-        let mesh_buffer = backend
-            .device
-            .create_buffer(
-                BufferDesc {
-                    size: MAX_GPU_MESHES * size_of::<GpuMesh>(),
-                    usage: vk::BufferUsageFlags::STORAGE_BUFFER,
-                    mapped: true,
-                },
-                None,
-            )
-            .unwrap();
+        let vertex_buffer = backend.device.create_buffer(
+            BufferDesc::new_gpu_only(
+                VERTEX_BUFFER_CAPACITY,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            ),
+            "vertex buffer",
+            None,
+        )?;
 
-        let vertex_buffer = backend
+        let bindless_texture_sizes = backend
             .device
             .create_buffer(
-                BufferDesc {
-                    size: VERTEX_BUFFER_CAPACITY,
-                    usage: vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                        | vk::BufferUsageFlags::INDEX_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                    mapped: false,
-                },
+                BufferDesc::new_cpu_to_gpu(
+                    backend.device.max_bindless_descriptor_count() as usize
+                        * std::mem::size_of::<[f32; 4]>(),
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                ),
+                "bindless_texture_sizes",
                 None,
             )
             .unwrap();
 
         let bindless_descriptor_set = create_bindless_descriptor_set(backend.device.as_ref());
 
+        // `meshes`
         Self::write_descriptor_set_buffer(
             &backend.device.raw,
             bindless_descriptor_set,
@@ -298,11 +406,20 @@ impl WorldRenderer {
             &mesh_buffer,
         );
 
+        // `vertices`
         Self::write_descriptor_set_buffer(
             &backend.device.raw,
             bindless_descriptor_set,
             1,
             &vertex_buffer,
+        );
+
+        // `bindless_texture_sizes`
+        Self::write_descriptor_set_buffer(
+            &backend.device.raw,
+            bindless_descriptor_set,
+            2,
+            &bindless_texture_sizes,
         );
 
         let supersample_count = 128;
@@ -350,6 +467,7 @@ impl WorldRenderer {
 
             next_bindless_image_id: 0,
             next_instance_handle: 0,
+            bindless_texture_sizes,
 
             rg_debug_hook: None,
             render_mode: RenderMode::Standard,
@@ -358,13 +476,15 @@ impl WorldRenderer {
 
             supersample_offsets,
 
-            ssgi: Default::default(),
-            rtr: RtrRenderer::new(backend.device.as_ref()),
+            post: PostProcessRenderer::new(backend.device.as_ref())?,
+            ssgi: SsgiRenderer::default(),
+            rtr: RtrRenderer::new(backend.device.as_ref())?,
             lighting: LightingRenderer::new(),
-            csgi: CsgiRenderer::default(),
-            rtdgi: RtdgiRenderer::new(backend.device.as_ref()),
+            ircache: IrcacheRenderer::new(backend.device.as_ref()),
+            rtdgi: RtdgiRenderer::default(),
             taa: TaaRenderer::new(),
-            shadow_denoise: Default::default(),
+            shadow_denoise: ShadowDenoiseRenderer::default(),
+            ibl: IblRenderer::default(),
 
             #[cfg(feature = "dlss")]
             dlss,
@@ -374,12 +494,24 @@ impl WorldRenderer {
             temporal_upscale_extent,
 
             debug_mode: RenderDebugMode::None,
-            debug_shading_mode: 0,
+            debug_shading_mode: if backend.device.ray_tracing_enabled() {
+                0
+            } else {
+                // RTX OFF; HACK: reflections buffers currently smear without ray tracing.
+                4
+            },
+            debug_show_wrc: false,
             ev_shift: 0.0,
-            world_gi_scale: 1.0,
+            dynamic_exposure: Default::default(),
+            contrast: 1.0,
+
             sun_size_multiplier: 1.0, // Sun as seen from Earth
             sun_color_multiplier: Vec3::ONE,
             sky_ambient: Vec3::ZERO,
+
+            render_overrides: Default::default(),
+
+            exposure_state: Default::default(),
         })
     }
 
@@ -418,7 +550,7 @@ impl WorldRenderer {
         let write_descriptor_set = vk::WriteDescriptorSet::builder()
             .dst_set(self.bindless_descriptor_set)
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .dst_binding(2)
+            .dst_binding(BINDLESS_TEXURES_BINDING_INDEX as _)
             .dst_array_element(handle.0 as _)
             .image_info(std::slice::from_ref(&image_info))
             .build();
@@ -441,16 +573,31 @@ impl WorldRenderer {
                 .last()
                 .unwrap()
                 .backing_image()
-                .view(self.device.as_ref(), &ImageViewDesc::default()),
+                .view(self.device.as_ref(), &ImageViewDesc::default())
+                .unwrap(),
         );
 
         assert_eq!(handle.0 as usize, id);
     }
 
     pub fn add_image(&mut self, image: Arc<Image>) -> BindlessImageHandle {
-        let handle = self
-            .add_bindless_image_view(image.view(self.device.as_ref(), &ImageViewDesc::default()));
+        let image_size: [f32; 4] = image.desc.extent_inv_extent_2d();
+
+        let handle = self.add_bindless_image_view(
+            image
+                .view(self.device.as_ref(), &ImageViewDesc::default())
+                .unwrap(),
+        );
+
         self.bindless_images.push(image);
+
+        bytemuck::checked::cast_slice_mut::<u8, [f32; 4]>(
+            self.bindless_texture_sizes
+                .allocation
+                .mapped_slice_mut()
+                .unwrap(),
+        )[handle.0 as usize] = image_size;
+
         handle
     }
 
@@ -526,11 +673,14 @@ impl WorldRenderer {
 
         let total_buffer_size = buffer_builder.current_offset();
         let mut vertex_buffer = self.vertex_buffer.lock();
-        buffer_builder.upload(
-            self.device.as_ref(),
-            Arc::get_mut(&mut *vertex_buffer).expect("refs may not be retained"),
-            self.vertex_buffer_written,
-        );
+        buffer_builder
+            .upload(
+                self.device.as_ref(),
+                Arc::get_mut(&mut *vertex_buffer).expect("refs may not be retained"),
+                self.vertex_buffer_written,
+            )
+            .map_err(|err| self.device.report_error(err))
+            .unwrap();
         self.vertex_buffer_written += total_buffer_size;
 
         let mesh_buffer_dst = unsafe {
@@ -541,14 +691,14 @@ impl WorldRenderer {
             std::slice::from_raw_parts_mut(mesh_buffer_dst, MAX_GPU_MESHES)
         };
 
-        let base_da = vertex_buffer.device_address(&self.device);
-        let vertex_buffer_da = base_da + vertex_core_offset as u64;
-        let index_buffer_da = base_da + vertex_index_offset as u64;
+        if self.device.ray_tracing_enabled() {
+            let base_da = vertex_buffer.device_address(&self.device);
+            let vertex_buffer_da = base_da + vertex_core_offset as u64;
+            let index_buffer_da = base_da + vertex_index_offset as u64;
 
-        let blas = self
-            .device
-            .create_ray_tracing_bottom_acceleration(
-                &RayTracingBottomAccelerationDesc {
+            let blas = self
+                .device
+                .create_ray_tracing_bottom_acceleration(&RayTracingBottomAccelerationDesc {
                     geometries: vec![RayTracingGeometryDesc {
                         geometry_type: RayTracingGeometryType::Triangle,
                         vertex_buffer: vertex_buffer_da,
@@ -567,10 +717,11 @@ impl WorldRenderer {
                                 .expect("mesh must not be empty"),
                         }],
                     }],
-                },
-                &self.accel_scratch,
-            )
-            .expect("blas");
+                })
+                .expect("blas");
+
+            self.mesh_blas.push(Arc::new(blas));
+        }
 
         mesh_buffer_dst[mesh_idx] = GpuMesh {
             vertex_core_offset,
@@ -586,8 +737,6 @@ impl WorldRenderer {
             index_buffer_offset: vertex_index_offset as u64,
             index_count: mesh.indices.len() as _,
         });
-
-        self.mesh_blas.push(Arc::new(blas));
 
         let mesh_lights = if opts.use_lights {
             let emissive_materials = mesh
@@ -626,24 +775,16 @@ impl WorldRenderer {
         MeshHandle(mesh_idx)
     }
 
-    pub fn add_instance(
-        &mut self,
-        mesh: MeshHandle,
-        position: Vec3,
-        rotation: Quat,
-    ) -> InstanceHandle {
+    pub fn add_instance(&mut self, mesh: MeshHandle, transform: Affine3A) -> InstanceHandle {
         let handle = self.next_instance_handle;
         self.next_instance_handle += 1;
         let handle = InstanceHandle(handle);
 
         let index = self.instances.len();
-        let rotation_mat = Mat3::from_quat(rotation);
 
         self.instances.push(MeshInstance {
-            rotation: rotation_mat,
-            position,
-            prev_rotation: rotation_mat,
-            prev_position: position,
+            transform,
+            prev_transform: transform,
             mesh,
             dynamic_parameters: InstanceDynamicParameters::default(),
         });
@@ -671,10 +812,9 @@ impl WorldRenderer {
         }
     }
 
-    pub fn set_instance_transform(&mut self, inst: InstanceHandle, position: Vec3, rotation: Quat) {
+    pub fn set_instance_transform(&mut self, inst: InstanceHandle, transform: Affine3A) {
         let index = self.instance_handle_to_index[&inst];
-        self.instances[index].position = position;
-        self.instances[index].rotation = Mat3::from_quat(rotation);
+        self.instances[index].transform = transform;
     }
 
     pub fn get_instance_dynamic_parameters(
@@ -704,8 +844,7 @@ impl WorldRenderer {
                         .iter()
                         .map(|inst| RayTracingInstanceDesc {
                             blas: self.mesh_blas[inst.mesh.0].clone(),
-                            position: inst.position,
-                            rotation: inst.rotation,
+                            transformation: inst.transform,
                             mesh_index: inst.mesh.0 as u32,
                         })
                         .collect::<Vec<_>>(),
@@ -737,8 +876,7 @@ impl WorldRenderer {
             .iter()
             .map(|inst| RayTracingInstanceDesc {
                 blas: self.mesh_blas[inst.mesh.0].clone(),
-                position: inst.position,
-                rotation: inst.rotation,
+                transformation: inst.transform,
                 mesh_index: inst.mesh.0 as u32,
             })
             .collect::<Vec<_>>();
@@ -765,6 +903,8 @@ impl WorldRenderer {
                 tlas,
                 &accel_scratch,
             );
+
+            Ok(())
         });
 
         tlas
@@ -772,9 +912,43 @@ impl WorldRenderer {
 
     fn store_prev_mesh_transforms(&mut self) {
         for inst in &mut self.instances {
-            inst.prev_position = inst.position;
-            inst.prev_rotation = inst.rotation;
+            inst.prev_transform = inst.transform;
         }
+    }
+
+    fn update_pre_exposure(&mut self) {
+        let dt = 1.0 / 60.0; // TODO
+
+        self.dynamic_exposure.update(-self.post.image_log2_lum, dt);
+        let ev_mult = (self.ev_shift + self.dynamic_exposure.ev_smoothed()).exp2();
+
+        let exposure_state = &mut self.exposure_state[self.render_mode as usize];
+
+        exposure_state.pre_mult_prev = exposure_state.pre_mult;
+
+        match self.render_mode {
+            RenderMode::Standard => {
+                // Smoothly blend the pre-exposure.
+                // TODO: Ensure we correctly use the previous frame's pre-mult in temporal shaders,
+                // and then nuke/speed-up this blending.
+                exposure_state.pre_mult = exposure_state.pre_mult * 0.9 + ev_mult * 0.1;
+
+                // Put the rest in post-exposure.
+                exposure_state.post_mult = ev_mult / exposure_state.pre_mult;
+            }
+            RenderMode::Reference => {
+                // The path tracer doesn't need pre-exposure.
+
+                exposure_state.pre_mult = 1.0;
+                exposure_state.post_mult = ev_mult;
+            }
+        }
+
+        exposure_state.pre_mult_delta = exposure_state.pre_mult / exposure_state.pre_mult_prev;
+    }
+
+    pub fn exposure_state(&self) -> ExposureState {
+        self.exposure_state[self.render_mode as usize]
     }
 
     pub fn prepare_render_graph(
@@ -782,6 +956,8 @@ impl WorldRenderer {
         rg: &mut rg::TemporalRenderGraph,
         frame_desc: &WorldFrameDesc,
     ) -> rg::Handle<Image> {
+        self.update_pre_exposure();
+
         rg.predefined_descriptor_set_layouts.insert(
             1,
             rg::PredefinedDescriptorSet {
@@ -795,9 +971,12 @@ impl WorldRenderer {
 
         match self.render_mode {
             RenderMode::Standard => {
-                self.taa.current_supersample_offset = self.supersample_offsets
-                    [self.frame_idx as usize % self.supersample_offsets.len()];
-                //self.taa.current_supersample_offset = Vec2::ZERO;
+                if USE_TAA_JITTER {
+                    self.taa.current_supersample_offset = self.supersample_offsets
+                        [self.frame_idx as usize % self.supersample_offsets.len()];
+                } else {
+                    self.taa.current_supersample_offset = Vec2::ZERO;
+                }
 
                 #[cfg(feature = "dlss")]
                 {
@@ -858,8 +1037,10 @@ impl WorldRenderer {
             .instances
             .iter()
             .flat_map(|inst| {
-                let inst_position = inst.position;
-                let inst_rotation = inst.rotation;
+                let (_scale, rotation, translation) =
+                    inst.transform.to_scale_rotation_translation();
+                let inst_position = translation;
+                let inst_rotation = rotation;
 
                 let emissive_multiplier = Vec3::splat(inst.dynamic_parameters.emissive_multiplier);
 
@@ -876,20 +1057,15 @@ impl WorldRenderer {
 
         // Initialize constants for the maximum allowed cascade count, even if we're not using them,
         // so that we don't need to change the layout of frame constants up to this limit.
-        let mut gi_cascades: [GiCascadeConstants; MAX_CSGI_CASCADE_COUNT] = Default::default();
+        let mut ircache_cascades: [IrcacheCascadeConstants; IRCACHE_CASCADE_COUNT] =
+            Default::default();
 
-        self.csgi
-            .update_eye_position(&view_constants.eye_position(), self.world_gi_scale);
+        self.ircache
+            .update_eye_position(view_constants.eye_position());
 
         // Actually set the cascade constants we're using
-        for (i, c) in self
-            .csgi
-            .constants(self.world_gi_scale)
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            gi_cascades[i] = c;
+        for (i, c) in self.ircache.constants().iter().copied().enumerate() {
+            ircache_cascades[i] = c;
         }
 
         let real_sun_angular_radius = 0.53f32.to_radians() * 0.5;
@@ -904,11 +1080,16 @@ impl WorldRenderer {
             sun_color_multiplier: self.sun_color_multiplier.extend(0.0),
             sky_ambient: self.sky_ambient.extend(0.0),
             triangle_light_count: triangle_lights.len() as _,
-            world_gi_scale: self.world_gi_scale,
-            pad0: 0,
-            pad1: 0,
-            pad2: 0,
-            gi_cascades,
+
+            pre_exposure: self.exposure_state().pre_mult,
+            pre_exposure_prev: self.exposure_state().pre_mult_prev,
+            pre_exposure_delta: self.exposure_state().pre_mult_delta,
+            pad0: 0.0,
+
+            render_overrides: self.render_overrides,
+
+            ircache_grid_center: self.ircache.grid_center().extend(1.0),
+            ircache_cascades,
         });
 
         let instance_dynamic_parameters_offset = dynamic_constants

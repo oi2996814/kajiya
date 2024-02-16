@@ -136,9 +136,11 @@ impl<'rg> SimpleRenderPass<'rg, RgComputePipelineHandle> {
         self.pass.render(move |api| {
             state.patch_const_blobs(api);
 
-            let pipeline = api.bind_compute_pipeline(state.create_pipeline_binding());
+            let pipeline = api.bind_compute_pipeline(state.create_pipeline_binding())?;
 
             pipeline.dispatch(extent);
+
+            Ok(())
         });
     }
 
@@ -149,9 +151,11 @@ impl<'rg> SimpleRenderPass<'rg, RgComputePipelineHandle> {
         self.pass.render(move |api| {
             state.patch_const_blobs(api);
 
-            let pipeline = api.bind_compute_pipeline(state.create_pipeline_binding());
+            let pipeline = api.bind_compute_pipeline(state.create_pipeline_binding())?;
 
             pipeline.dispatch_indirect(args_buffer_ref, args_buffer_offset);
+
+            Ok(())
         });
     }
 }
@@ -214,9 +218,11 @@ impl<'rg> SimpleRenderPass<'rg, RgRtPipelineHandle> {
                 state
                     .create_pipeline_binding()
                     .descriptor_set(3, &[tlas_ref.bind()]),
-            );
+            )?;
 
             pipeline.trace_rays(extent);
+
+            Ok(())
         });
     }
 
@@ -237,9 +243,11 @@ impl<'rg> SimpleRenderPass<'rg, RgRtPipelineHandle> {
                 state
                     .create_pipeline_binding()
                     .descriptor_set(3, &[tlas_ref.bind()]),
-            );
+            )?;
 
             pipeline.trace_rays_indirect(args_buffer_ref, args_buffer_offset);
+
+            Ok(())
         });
     }
 }
@@ -318,6 +326,18 @@ impl<'rg, RgPipelineHandle> SimpleRenderPass<'rg, RgPipelineHandle> {
         self
     }
 
+    pub fn write_no_sync<Res>(mut self, handle: &mut Handle<Res>) -> Self
+    where
+        Res: Resource + 'static,
+        Ref<Res, GpuUav>: BindRgRef,
+    {
+        let handle_ref = self.pass.write_no_sync(handle, AccessType::AnyShaderWrite);
+
+        self.state.bindings.push(BindRgRef::bind(&handle_ref));
+
+        self
+    }
+
     pub fn write_view(
         mut self,
         handle: &mut Handle<Image>,
@@ -369,4 +389,32 @@ impl<'rg, RgPipelineHandle> SimpleRenderPass<'rg, RgPipelineHandle> {
         self.state.raw_descriptor_sets.push((set_idx, set));
         self
     }
+
+    pub fn bind<Binding>(self, binding: &Binding) -> Self
+    where
+        Binding: BindToSimpleRenderPass<'rg, RgPipelineHandle>,
+    {
+        binding.bind(self)
+    }
+
+    pub fn bind_mut<Binding>(self, binding: &mut Binding) -> Self
+    where
+        Binding: BindMutToSimpleRenderPass<'rg, RgPipelineHandle>,
+    {
+        binding.bind_mut(self)
+    }
+}
+
+pub trait BindToSimpleRenderPass<'rg, RgPipelineHandle> {
+    fn bind(
+        &self,
+        pass: SimpleRenderPass<'rg, RgPipelineHandle>,
+    ) -> SimpleRenderPass<'rg, RgPipelineHandle>;
+}
+
+pub trait BindMutToSimpleRenderPass<'rg, RgPipelineHandle> {
+    fn bind_mut(
+        &mut self,
+        pass: SimpleRenderPass<'rg, RgPipelineHandle>,
+    ) -> SimpleRenderPass<'rg, RgPipelineHandle>;
 }

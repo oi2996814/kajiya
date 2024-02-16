@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{dynamic_constants::DynamicConstants, MAX_DESCRIPTOR_SETS};
+use crate::{dynamic_constants::DynamicConstants, BackendError, MAX_DESCRIPTOR_SETS};
 
 use super::{
     device::Device,
@@ -9,11 +9,10 @@ use super::{
         ShaderPipelineStage,
     },
 };
-use anyhow::{Context, Result};
 use ash::vk;
 use byte_slice_cast::AsSliceOf;
 use bytes::Bytes;
-use glam::{Mat3, Vec3};
+use glam::Affine3A;
 use parking_lot::Mutex;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -42,8 +41,7 @@ pub struct RayTracingGeometryDesc {
 #[derive(Clone)]
 pub struct RayTracingInstanceDesc {
     pub blas: Arc<RayTracingAcceleration>,
-    pub position: Vec3,
-    pub rotation: Mat3,
+    pub transformation: Affine3A,
     pub mesh_index: u32,
 }
 
@@ -75,23 +73,20 @@ pub struct RayTracingAccelerationScratchBuffer {
     buffer: Arc<Mutex<super::buffer::Buffer>>,
 }
 
+const RT_TLAS_SCRATCH_BUFFER_SIZE: usize = 256 * 1024;
+
 impl Device {
     pub fn create_ray_tracing_acceleration_scratch_buffer(
         &self,
-    ) -> Result<RayTracingAccelerationScratchBuffer> {
-        const INITIAL_SIZE: usize = 1024 * 1024 * 144;
-
-        let buffer = self
-            .create_buffer(
-                super::buffer::BufferDesc {
-                    size: INITIAL_SIZE,
-                    usage: vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    mapped: false,
-                },
-                None,
-            )
-            .context("Acceleration structure scratch buffer")?;
+    ) -> Result<RayTracingAccelerationScratchBuffer, BackendError> {
+        let buffer = self.create_buffer(
+            super::buffer::BufferDesc::new_gpu_only(
+                RT_TLAS_SCRATCH_BUFFER_SIZE,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            ),
+            "Acceleration structure scratch buffer",
+            None,
+        )?;
 
         Ok(RayTracingAccelerationScratchBuffer {
             buffer: Arc::new(Mutex::new(buffer)),
@@ -101,15 +96,14 @@ impl Device {
     pub fn create_ray_tracing_bottom_acceleration(
         &self,
         desc: &RayTracingBottomAccelerationDesc,
-        scratch_buffer: &RayTracingAccelerationScratchBuffer,
-    ) -> Result<RayTracingAcceleration> {
+    ) -> Result<RayTracingAcceleration, BackendError> {
         //log::trace!("Creating ray tracing bottom acceleration: {:?}", desc);
 
-        let geometries: Result<Vec<ash::vk::AccelerationStructureGeometryKHR>> = desc
+        let geometries: Result<Vec<ash::vk::AccelerationStructureGeometryKHR>, BackendError> = desc
             .geometries
             .iter()
             .map(
-                |desc| -> Result<ash::vk::AccelerationStructureGeometryKHR> {
+                |desc| -> Result<ash::vk::AccelerationStructureGeometryKHR, BackendError> {
                     let part: RayTracingGeometryPart = desc.parts[0];
 
                     let geometry = ash::vk::AccelerationStructureGeometryKHR::builder()
@@ -170,7 +164,7 @@ impl Device {
             &build_range_infos,
             &max_primitive_counts,
             preallocate_bytes,
-            scratch_buffer,
+            None,
         )
     }
 
@@ -178,7 +172,7 @@ impl Device {
         &self,
         desc: &RayTracingTopAccelerationDesc,
         scratch_buffer: &RayTracingAccelerationScratchBuffer,
-    ) -> Result<RayTracingAcceleration> {
+    ) -> Result<RayTracingAcceleration, BackendError> {
         //log::trace!("Creating ray tracing top acceleration: {:?}", desc);
 
         // Create instance buffer
@@ -196,19 +190,19 @@ impl Device {
                         )
                 };
 
-                let transform: [f32; 12] = [
-                    desc.rotation.x_axis.x,
-                    desc.rotation.y_axis.x,
-                    desc.rotation.z_axis.x,
-                    desc.position.x,
-                    desc.rotation.x_axis.y,
-                    desc.rotation.y_axis.y,
-                    desc.rotation.z_axis.y,
-                    desc.position.y,
-                    desc.rotation.x_axis.z,
-                    desc.rotation.y_axis.z,
-                    desc.rotation.z_axis.z,
-                    desc.position.z,
+                let transform = [
+                    desc.transformation.x_axis.x,
+                    desc.transformation.y_axis.x,
+                    desc.transformation.z_axis.x,
+                    desc.transformation.translation.x,
+                    desc.transformation.x_axis.y,
+                    desc.transformation.y_axis.y,
+                    desc.transformation.z_axis.y,
+                    desc.transformation.translation.y,
+                    desc.transformation.x_axis.z,
+                    desc.transformation.y_axis.z,
+                    desc.transformation.z_axis.z,
+                    desc.transformation.translation.z,
                 ];
 
                 GeometryInstance::new(
@@ -225,23 +219,22 @@ impl Device {
             .collect();
 
         let instance_buffer_size = std::mem::size_of::<GeometryInstance>() * instances.len().max(1);
-        let instance_buffer = self
-            .create_buffer(
-                super::buffer::BufferDesc {
-                    size: instance_buffer_size,
-                    usage: ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                    mapped: false,
-                },
-                unsafe {
-                    (!instances.is_empty()).then(|| {
-                        std::slice::from_raw_parts(
-                            instances.as_ptr() as *const u8,
-                            instance_buffer_size,
-                        )
-                    })
-                },
-            )
-            .expect("TLAS instance buffer");
+        let instance_buffer = self.create_buffer(
+            super::buffer::BufferDesc::new_gpu_only(
+                instance_buffer_size,
+                ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            ),
+            "TLAS instance buffer",
+            unsafe {
+                (!instances.is_empty()).then(|| {
+                    std::slice::from_raw_parts(
+                        instances.as_ptr() as *const u8,
+                        instance_buffer_size,
+                    )
+                })
+            },
+        )?;
 
         let instance_buffer_address = instance_buffer.device_address(self);
 
@@ -277,7 +270,7 @@ impl Device {
             &build_range_infos,
             &max_primitive_counts,
             desc.preallocate_bytes,
-            scratch_buffer,
+            Some(scratch_buffer),
         )
     }
 
@@ -288,8 +281,8 @@ impl Device {
         build_range_infos: &[vk::AccelerationStructureBuildRangeInfoKHR],
         max_primitive_counts: &[u32],
         preallocate_bytes: usize,
-        scratch_buffer: &RayTracingAccelerationScratchBuffer,
-    ) -> Result<RayTracingAcceleration> {
+        scratch_buffer: Option<&RayTracingAccelerationScratchBuffer>,
+    ) -> Result<RayTracingAcceleration, BackendError> {
         let memory_requirements = unsafe {
             self.acceleration_structure_ext
                 .get_acceleration_structure_build_sizes(
@@ -308,17 +301,15 @@ impl Device {
         let backing_buffer_size: usize =
             preallocate_bytes.max(memory_requirements.acceleration_structure_size as usize);
 
-        let accel_buffer = self
-            .create_buffer(
-                super::buffer::BufferDesc {
-                    size: backing_buffer_size,
-                    usage: vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    mapped: false,
-                },
-                None,
-            )
-            .context("Acceleration structure buffer")?;
+        let accel_buffer = self.create_buffer(
+            super::buffer::BufferDesc::new_gpu_only(
+                backing_buffer_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            ),
+            "Acceleration structure buffer",
+            None,
+        )?;
 
         let accel_info = ash::vk::AccelerationStructureCreateInfoKHR::builder()
             .ty(ty)
@@ -326,70 +317,92 @@ impl Device {
             .size(backing_buffer_size as u64)
             .build();
 
-        unsafe {
-            let accel_raw = self
-                .acceleration_structure_ext
-                .create_acceleration_structure(&accel_info, None)
-                .context("create_acceleration_structure")?;
+        let mut tmp_scratch_buffer = None;
+        let mut scratch_buffer_lock;
 
-            let scratch_buffer = scratch_buffer.buffer.lock();
-            assert!(
-                memory_requirements.build_scratch_size as usize <= scratch_buffer.desc.size,
-                "todo: resize scratch"
+        let scratch_buffer = if let Some(scratch_buffer) = scratch_buffer {
+            scratch_buffer_lock = scratch_buffer.buffer.lock();
+            &mut *scratch_buffer_lock
+        } else {
+            tmp_scratch_buffer = Some(
+                self.create_buffer(
+                    super::buffer::BufferDesc::new_gpu_only(
+                        memory_requirements.build_scratch_size as usize,
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
+                    // TODO: query minAccelerationStructureScratchOffsetAlignment
+                    .alignment(256),
+                    "Acceleration structure scratch buffer",
+                    None,
+                )?,
             );
 
-            /*let scratch_buffer = self
-            .create_buffer(
-                super::buffer::BufferDesc {
-                    size: memory_requirements.build_scratch_size as _,
-                    usage: vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    mapped: false,
-                },
-                None,
-            )
-            .context("Acceleration structure scratch buffer")?;*/
+            tmp_scratch_buffer.as_mut().unwrap()
+        };
 
-            geometry_info.dst_acceleration_structure = accel_raw;
-            geometry_info.scratch_data = ash::vk::DeviceOrHostAddressKHR {
-                device_address: self.raw.get_buffer_device_address(
-                    &ash::vk::BufferDeviceAddressInfo::builder().buffer(scratch_buffer.raw),
-                ),
-            };
+        let do_the_build = move || -> Result<RayTracingAcceleration, BackendError> {
+            unsafe {
+                let accel_raw = self
+                .acceleration_structure_ext
+                .create_acceleration_structure(&accel_info, None)
+                //.context("create_acceleration_structure")?;
+                ?;
 
-            self.with_setup_cb(|cb| {
-                self.acceleration_structure_ext
-                    .cmd_build_acceleration_structures(
-                        cb,
-                        std::slice::from_ref(&geometry_info),
-                        std::slice::from_ref(&build_range_infos),
-                    );
-
-                self.raw.cmd_pipeline_barrier(
-                    cb,
-                    ash::vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                    ash::vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                    ash::vk::DependencyFlags::empty(),
-                    &[ash::vk::MemoryBarrier::builder()
-                        .src_access_mask(
-                            ash::vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
-                                | ash::vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
-                        )
-                        .dst_access_mask(
-                            ash::vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
-                                | ash::vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
-                        )
-                        .build()],
-                    &[],
-                    &[],
+                assert!(
+                    memory_requirements.build_scratch_size as usize <= scratch_buffer.desc.size,
+                    "TODO: resize scratch; see `RT_SCRATCH_BUFFER_SIZE`"
                 );
-            });
 
-            Ok(RayTracingAcceleration {
-                raw: accel_raw,
-                backing_buffer: accel_buffer,
-            })
+                geometry_info.dst_acceleration_structure = accel_raw;
+                geometry_info.scratch_data = ash::vk::DeviceOrHostAddressKHR {
+                    device_address: self.raw.get_buffer_device_address(
+                        &ash::vk::BufferDeviceAddressInfo::builder().buffer(scratch_buffer.raw),
+                    ),
+                };
+
+                self.with_setup_cb(|cb| {
+                    self.acceleration_structure_ext
+                        .cmd_build_acceleration_structures(
+                            cb,
+                            std::slice::from_ref(&geometry_info),
+                            std::slice::from_ref(&build_range_infos),
+                        );
+
+                    self.raw.cmd_pipeline_barrier(
+                        cb,
+                        ash::vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                        ash::vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                        ash::vk::DependencyFlags::empty(),
+                        &[ash::vk::MemoryBarrier::builder()
+                            .src_access_mask(
+                                ash::vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                                    | ash::vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                            )
+                            .dst_access_mask(
+                                ash::vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                                    | ash::vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                            )
+                            .build()],
+                        &[],
+                        &[],
+                    );
+                })?;
+
+                Ok(RayTracingAcceleration {
+                    raw: accel_raw,
+                    backing_buffer: accel_buffer,
+                })
+            }
+        };
+
+        let res = do_the_build();
+
+        if let Some(tmp_scratch_buffer) = tmp_scratch_buffer {
+            self.immediate_destroy_buffer(tmp_scratch_buffer);
         }
+
+        res
     }
 
     pub fn fill_ray_tracing_instance_buffer(
@@ -409,19 +422,19 @@ impl Device {
                     )
             };
 
-            let transform: [f32; 12] = [
-                desc.rotation.x_axis.x,
-                desc.rotation.y_axis.x,
-                desc.rotation.z_axis.x,
-                desc.position.x,
-                desc.rotation.x_axis.y,
-                desc.rotation.y_axis.y,
-                desc.rotation.z_axis.y,
-                desc.position.y,
-                desc.rotation.x_axis.z,
-                desc.rotation.y_axis.z,
-                desc.rotation.z_axis.z,
-                desc.position.z,
+            let transform = [
+                desc.transformation.x_axis.x,
+                desc.transformation.y_axis.x,
+                desc.transformation.z_axis.x,
+                desc.transformation.translation.x,
+                desc.transformation.x_axis.y,
+                desc.transformation.y_axis.y,
+                desc.transformation.z_axis.y,
+                desc.transformation.translation.y,
+                desc.transformation.x_axis.z,
+                desc.transformation.y_axis.z,
+                desc.transformation.z_axis.z,
+                desc.transformation.translation.z,
             ];
 
             GeometryInstance::new(
@@ -554,7 +567,7 @@ impl Device {
         &self,
         desc: &RayTracingShaderTableDesc,
         pipeline: vk::Pipeline,
-    ) -> Result<RayTracingShaderTable> {
+    ) -> Result<RayTracingShaderTable, BackendError> {
         log::trace!("Creating ray tracing shader table: {:?}", desc);
 
         let shader_group_handle_size = self
@@ -562,7 +575,7 @@ impl Device {
             .shader_group_handle_size as usize;
         let group_count =
             (desc.raygen_entry_count + desc.miss_entry_count + desc.hit_entry_count) as usize;
-        let group_handles_size = (shader_group_handle_size * group_count) as usize;
+        let group_handles_size = shader_group_handle_size * group_count;
 
         let group_handles: Vec<u8> = unsafe {
             self.ray_tracing_pipeline_ext
@@ -572,44 +585,44 @@ impl Device {
                     group_count as _,
                     group_handles_size,
                 )
-                .context("get_ray_tracing_shader_group_handles")?
+                //.context("get_ray_tracing_shader_group_handles")
+                ?
         };
 
         let prog_size = shader_group_handle_size;
 
-        let create_binding_table = |entry_offset: u32,
-                                    entry_count: u32|
-         -> Result<Option<crate::vulkan::buffer::Buffer>> {
-            if 0 == entry_count {
-                return Ok(None);
-            }
+        let create_binding_table =
+            |entry_offset: u32,
+             entry_count: u32|
+             -> Result<Option<crate::vulkan::buffer::Buffer>, BackendError> {
+                if 0 == entry_count {
+                    return Ok(None);
+                }
 
-            let mut shader_binding_table_data = vec![0u8; (entry_count as usize * prog_size) as _];
+                let mut shader_binding_table_data =
+                    vec![0u8; (entry_count as usize * prog_size) as _];
 
-            for dst in 0..(entry_count as usize) {
-                let src = dst + entry_offset as usize;
-                shader_binding_table_data
-                    [dst * prog_size..dst * prog_size + shader_group_handle_size]
-                    .copy_from_slice(
-                        &group_handles[src * shader_group_handle_size
-                            ..src * shader_group_handle_size + shader_group_handle_size],
-                    );
-            }
+                for dst in 0..(entry_count as usize) {
+                    let src = dst + entry_offset as usize;
+                    shader_binding_table_data
+                        [dst * prog_size..dst * prog_size + shader_group_handle_size]
+                        .copy_from_slice(
+                            &group_handles[src * shader_group_handle_size
+                                ..src * shader_group_handle_size + shader_group_handle_size],
+                        );
+                }
 
-            Ok(Some(
-                self.create_buffer(
-                    super::buffer::BufferDesc {
-                        size: shader_binding_table_data.len(),
-                        usage: vk::BufferUsageFlags::TRANSFER_SRC
+                Ok(Some(self.create_buffer(
+                    super::buffer::BufferDesc::new_gpu_only(
+                        shader_binding_table_data.len(),
+                        vk::BufferUsageFlags::TRANSFER_SRC
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                             | vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
-                        mapped: false,
-                    },
+                    ),
+                    "SBT sub-buffer",
                     Some(&shader_binding_table_data),
-                )
-                .context("SBT sub-buffer")?,
-            ))
-        };
+                )?))
+            };
 
         let raygen_shader_binding_table = create_binding_table(0, desc.raygen_entry_count)?;
         let miss_shader_binding_table =
@@ -760,7 +773,9 @@ pub fn create_ray_tracing_pipeline(
 
             match desc.desc.stage {
                 ShaderPipelineStage::RayGen => {
-                    assert!(prev_stage == None || prev_stage == Some(ShaderPipelineStage::RayGen));
+                    assert!(
+                        prev_stage.is_none() || prev_stage == Some(ShaderPipelineStage::RayGen)
+                    );
                     raygen_entry_count += 1;
 
                     let (module, entry_point) = create_shader_module(desc);
@@ -865,13 +880,12 @@ pub fn create_ray_tracing_pipeline(
                     .build()],
                 None,
             )
-            .unwrap()[0];
+            .expect("create_ray_tracing_pipelines")[0];
 
         let mut descriptor_pool_sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
         for bindings in set_layout_info.iter() {
             for ty in bindings.values() {
-                if let Some(mut dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty)
-                {
+                if let Some(dps) = descriptor_pool_sizes.iter_mut().find(|item| item.ty == *ty) {
                     dps.descriptor_count += 1;
                 } else {
                     descriptor_pool_sizes.push(vk::DescriptorPoolSize {
@@ -891,7 +905,7 @@ pub fn create_ray_tracing_pipeline(
                 },
                 pipeline,
             )
-            .expect("SBT");
+            .map_err(|err| device.report_error(err))?;
 
         Ok(RayTracingPipeline {
             common: ShaderPipelineCommon {
@@ -966,7 +980,7 @@ impl GeometryInstance {
     }
 
     fn set_flags(&mut self, flags: ash::vk::GeometryInstanceFlagsKHR) {
-        let flags = flags.as_raw() as u32;
+        let flags = flags.as_raw();
         self.instance_sbt_offset_and_flags |= flags << 24;
     }
 }
